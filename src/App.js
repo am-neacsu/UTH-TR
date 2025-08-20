@@ -15,6 +15,8 @@ import {
   PlayCircle,
   PauseCircle,
   CheckCircle2,
+  Trophy,
+  Download,
 } from 'lucide-react';
 
 import { LayoutGroup, motion } from 'framer-motion';
@@ -36,6 +38,9 @@ import {
   limit,
   documentId,
 } from 'firebase/firestore';
+
+// Excel export
+import * as XLSX from 'xlsx';
 
 const firebaseConfig = {
   apiKey: 'AIzaSyAygueD0U3-aRMarRi7thg5M4Z4QnH21Po',
@@ -117,10 +122,59 @@ const shuffle = (arr) => {
   return a;
 };
 
+// £ format helper
+const gbp = (n) =>
+  new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 })
+    .format(Number(n || 0));
+
+/** Flatten players; include a synthetic id for selects */
+const flatPlayers = (tables) => {
+  const rows = [];
+  for (const t of tables) {
+    const st = getStatus(t);
+    (t.players || []).forEach((p, idx) => {
+      const seat = p.seat ?? idx + 1;
+      rows.push({
+        id: `${t.id}|${seat}|${p.name}`,  // for dropdowns
+        tableId: t.id,
+        tableNumber: Number(t.tableNumber) || 0,
+        status: st,
+        seat,
+        name: p.name || '',
+        chips: Number(p.chips || 0),
+      });
+    });
+  }
+  return rows;
+};
+
+const tableSummaryRows = (tables) => {
+  return tables.map((t) => {
+    const st = getStatus(t);
+    const players = t.players || [];
+    const chips = players.map((p) => Number(p.chips || 0));
+    const total = chips.reduce((a, b) => a + b, 0);
+    const count = players.length || 0;
+    const avg = count ? total / count : 0;
+    const min = chips.length ? Math.min(...chips) : 0;
+    const max = chips.length ? Math.max(...chips) : 0;
+    return {
+      tableNumber: Number(t.tableNumber) || 0,
+      status: st,
+      players: count,
+      totalChips: total,
+      averageStack: Math.round(avg),
+      minStack: min,
+      maxStack: max,
+      lastUpdated: t.lastUpdated || t.createdAt || '',
+    };
+  }).sort((a, b) => a.tableNumber - b.tableNumber);
+};
+
 // ===========================================================
 const PokerTournamentApp = () => {
   const [tables, setTables] = useState([]);
-  const [currentView, setCurrentView] = useState('admin');
+  const [currentView, setCurrentView] = useState('admin'); // admin | draw | display | podium
   const [newTable, setNewTable] = useState({ tableNumber: '', players: [], status: 'not_playing' });
   const [newPlayer, setNewPlayer] = useState({ name: '', chips: '' });
   const [isCasting, setIsCasting] = useState(false);
@@ -150,10 +204,20 @@ const PokerTournamentApp = () => {
   const [animIndex, setAnimIndex] = useState(0);
   const animTimerRef = useRef(null);
 
-  // Presentation mode + fit + HUD visibility
+  // Presentation + fit + HUD
   const [drawPresentation, setDrawPresentation] = useState(false);
   const [fitToScreen, setFitToScreen] = useState(true);
   const [hudVisible, setHudVisible] = useState(true);
+
+  // Podium config (prizes + manual winners)
+  const [podiumConfig, setPodiumConfig] = useState({
+    firstPrize: 0,
+    secondPrize: 0,
+    thirdPrize: 0,
+    firstWinnerId: '',
+    secondWinnerId: '',
+    thirdWinnerId: '',
+  });
 
   // ---------- init Firestore + live listener ----------
   useEffect(() => {
@@ -355,6 +419,76 @@ const PokerTournamentApp = () => {
       console.error('Delete all failed:', e);
       window.alert(`Delete failed: ${e.code || 'error'} — ${e.message || ''}`);
     }
+  };
+
+  // ---------- Excel exports ----------
+  // By Table (Table • Seat • Name • Chips) with a total row after each table + Summary sheet
+  const exportTableSummaryToExcel = () => {
+    const byTable = [];
+    const tablesSorted = [...tables].sort(
+      (a, b) => (Number(a.tableNumber) || 0) - (Number(b.tableNumber) || 0)
+    );
+
+    for (const t of tablesSorted) {
+      let tableTotal = 0;
+      const players = t.players || [];
+      players.forEach((p, idx) => {
+        const seat = p.seat ?? idx + 1;
+        const chips = Number(p.chips || 0);
+        tableTotal += chips;
+        byTable.push({
+          Table: Number(t.tableNumber) || 0,
+          Seat: seat,
+          Name: p.name || '',
+          Chips: chips,
+        });
+      });
+      // total row for this table
+      byTable.push({
+        Table: Number(t.tableNumber) || 0,
+        Seat: '',
+        Name: 'Table total',
+        Chips: tableTotal,
+      });
+      // spacer
+      byTable.push({ Table: '', Seat: '', Name: '', Chips: '' });
+    }
+
+    const summary = tableSummaryRows(tables).map((r) => ({
+      Table: r.tableNumber,
+      Status: r.status,
+      Players: r.players,
+      'Total Chips': r.totalChips,
+      'Average Stack': r.averageStack,
+      'Min Stack': r.minStack,
+      'Max Stack': r.maxStack,
+      'Last Updated': r.lastUpdated,
+    }));
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(byTable), 'By Table');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), 'Summary');
+    const dateTag = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(wb, `table_summary_${dateTag}.xlsx`);
+  };
+
+  // Podium export with £ prize column (uses current podiumConfig)
+  const exportPodiumToExcel = (winners = []) => {
+    const rows = winners.map((w, i) => ({
+      Place: i + 1,
+      Name: w?.name || '',
+      Table: w?.tableNumber || '',
+      Seat: w?.seat || '',
+      Chips: w?.chips ?? '',
+      Prize:
+        i === 0 ? gbp(podiumConfig.firstPrize)
+        : i === 1 ? gbp(podiumConfig.secondPrize)
+        : gbp(podiumConfig.thirdPrize),
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Podium');
+    const dateTag = new Date().toISOString().slice(0, 10);
+    XLSX.writeFile(wb, `podium_${dateTag}.xlsx`);
   };
 
   // ---------- casting helpers ----------
@@ -621,25 +755,41 @@ Start screen sharing now?`;
             </div>
           </h1>
 
-          <div className="flex gap-4 items-center">
-            <div className="flex gap-2">
-              <button
-                onClick={showCastingOptions}
-                className="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-              >
-                <Cast className="w-5 h-5" />
-                Cast to TV
-              </button>
+          <div className="flex gap-3 items-center flex-wrap">
+            <button
+              onClick={exportTableSummaryToExcel}
+              className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg flex items-center gap-2"
+              title="Export Table Summary (Excel)"
+            >
+              <Download className="w-4 h-4" />
+              Export Summary
+            </button>
 
-              <button
-                onClick={startScreenShare}
-                className="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-                title="Start screen sharing"
-              >
-                <Monitor className="w-4 h-4" />
-                Share Screen
-              </button>
-            </div>
+            <button
+              onClick={() => setCurrentView('podium')}
+              className="bg-pink-600 hover:bg-pink-700 px-4 py-2 rounded-lg flex items-center gap-2"
+              title="Show Podium"
+            >
+              <Trophy className="w-4 h-4" />
+              Podium
+            </button>
+
+            <button
+              onClick={showCastingOptions}
+              className="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+            >
+              <Cast className="w-5 h-5" />
+              Cast to TV
+            </button>
+
+            <button
+              onClick={startScreenShare}
+              className="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
+              title="Start screen sharing"
+            >
+              <Monitor className="w-4 h-4" />
+              Share Screen
+            </button>
 
             <button
               onClick={() => setCurrentView('display')}
@@ -1099,6 +1249,219 @@ Start screen sharing now?`;
     );
   };
 
+  // ---------- PODIUM VIEW (configurable) ----------
+  const renderPodiumView = () => {
+    const allPlayers = flatPlayers(tables).sort((a, b) => (b.chips || 0) - (a.chips || 0));
+
+    const resolveWinner = (id, fallbackIndex) =>
+      allPlayers.find((p) => p.id === id) || allPlayers[fallbackIndex];
+
+    const w1 = resolveWinner(podiumConfig.firstWinnerId, 0);
+    const w2 = resolveWinner(podiumConfig.secondWinnerId, 1);
+    const w3 = resolveWinner(podiumConfig.thirdWinnerId, 2);
+    const winners = [w1, w2, w3];
+
+    const Inner = () => (
+      <div className="min-h-screen text-white p-8 w-full">
+        {/* Setup bar */}
+        <div className="bg-gray-800 rounded-2xl p-4 mb-6">
+          <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+            <div>
+              <div className="text-xl font-bold mb-2">Podium setup</div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <label className="text-sm">
+                  <span className="block mb-1">1st Prize (£)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={podiumConfig.firstPrize}
+                    onChange={(e) =>
+                      setPodiumConfig((s) => ({ ...s, firstPrize: Number(e.target.value || 0) }))
+                    }
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                  />
+                </label>
+                <label className="text-sm">
+                  <span className="block mb-1">2nd Prize (£)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={podiumConfig.secondPrize}
+                    onChange={(e) =>
+                      setPodiumConfig((s) => ({ ...s, secondPrize: Number(e.target.value || 0) }))
+                    }
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                  />
+                </label>
+                <label className="text-sm">
+                  <span className="block mb-1">3rd Prize (£)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    value={podiumConfig.thirdPrize}
+                    onChange={(e) =>
+                      setPodiumConfig((s) => ({ ...s, thirdPrize: Number(e.target.value || 0) }))
+                    }
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <label className="text-sm">
+                <span className="block mb-1">Winner</span>
+                <select
+                  value={podiumConfig.firstWinnerId}
+                  onChange={(e) =>
+                    setPodiumConfig((s) => ({ ...s, firstWinnerId: e.target.value }))
+                  }
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                >
+                  <option value="">(Top by chips)</option>
+                  {allPlayers.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="text-sm">
+                <span className="block mb-1">Second</span>
+                <select
+                  value={podiumConfig.secondWinnerId}
+                  onChange={(e) =>
+                    setPodiumConfig((s) => ({ ...s, secondWinnerId: e.target.value }))
+                  }
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                >
+                  <option value="">(2nd by chips)</option>
+                  {allPlayers.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="text-sm">
+                <span className="block mb-1">Third</span>
+                <select
+                  value={podiumConfig.thirdWinnerId}
+                  onChange={(e) =>
+                    setPodiumConfig((s) => ({ ...s, thirdWinnerId: e.target.value }))
+                  }
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                >
+                  <option value="">(3rd by chips)</option>
+                  {allPlayers.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => setCurrentView('display')}
+                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
+              >
+                Back to Display
+              </button>
+              <button
+                onClick={() => exportPodiumToExcel(winners)}
+                className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg"
+              >
+                Export Winners (Excel)
+              </button>
+            </div>
+          </div>
+
+          {/* Title */}
+          <div className="text-center mb-8">
+            <div className="flex items-center justify-center gap-3">
+              <Trophy className="w-10 h-10 text-yellow-400" />
+              <h1 className="text-5xl font-extrabold">Podium</h1>
+            </div>
+            <div className="text-gray-300 mt-2">Announce the winners</div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-end">
+            {/* 2nd */}
+            <div className="bg-gradient-to-br from-slate-700 to-slate-800 rounded-2xl p-6 text-center shadow-lg">
+              <div className="text-2xl font-bold text-gray-300 mb-2">2nd</div>
+              {w2 ? (
+                <>
+                  <div className="text-3xl font-bold">{w2.name}</div>
+                  <div className="text-lg text-gray-300 mt-1">
+                    Table {w2.tableNumber} • Seat {w2.seat}
+                  </div>
+                  <div className="mt-2 text-gray-300">{gbp(podiumConfig.secondPrize)}</div>
+                  <div className="mt-2 text-4xl font-extrabold text-blue-300">
+                    {w2.chips.toLocaleString()} <span className="text-sm font-normal text-gray-400">chips</span>
+                  </div>
+                </>
+              ) : (
+                <div className="text-gray-400">—</div>
+              )}
+            </div>
+
+            {/* 1st */}
+            <div className="bg-gradient-to-br from-yellow-600 to-yellow-700 rounded-2xl p-8 text-center shadow-2xl scale-105">
+              <div className="text-3xl font-extrabold text-yellow-100 mb-2">Champion</div>
+              {w1 ? (
+                <>
+                  <div className="text-4xl font-black">{w1.name}</div>
+                  <div className="text-lg text-yellow-100/90 mt-1">
+                    Table {w1.tableNumber} • Seat {w1.seat}
+                  </div>
+                  <div className="mt-2 text-yellow-50">{gbp(podiumConfig.firstPrize)}</div>
+                  <div className="mt-3 text-5xl font-black text-white drop-shadow">
+                    {w1.chips.toLocaleString()} <span className="text-sm font-normal text-yellow-100/90">chips</span>
+                  </div>
+                </>
+              ) : (
+                <div className="text-yellow-100">—</div>
+              )}
+            </div>
+
+            {/* 3rd */}
+            <div className="bg-gradient-to-br from-amber-800 to-amber-900 rounded-2xl p-6 text-center shadow-lg">
+              <div className="text-2xl font-bold text-amber-200 mb-2">3rd</div>
+              {w3 ? (
+                <>
+                  <div className="text-3xl font-bold">{w3.name}</div>
+                  <div className="text-lg text-amber-200/80 mt-1">
+                    Table {w3.tableNumber} • Seat {w3.seat}
+                  </div>
+                  <div className="mt-2 text-amber-100">{gbp(podiumConfig.thirdPrize)}</div>
+                  <div className="mt-2 text-4xl font-extrabold text-amber-100">
+                    {w3.chips.toLocaleString()} <span className="text-sm font-normal text-amber-200/80">chips</span>
+                  </div>
+                </>
+              ) : (
+                <div className="text-amber-200/80">—</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+
+    return fitToScreen ? (
+      <FitToViewport bgClass="bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900">
+        <div className="w-[100vw]">
+          <Inner />
+        </div>
+      </FitToViewport>
+    ) : (
+      <Inner />
+    );
+  };
+
   // ---------- DISPLAY VIEW ----------
   const renderDisplayView = () => {
     const Inner = () => (
@@ -1108,44 +1471,45 @@ Start screen sharing now?`;
           <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400 mb-3">
             Ultimate Texas Hold&apos;em Tournament
           </h1>
-        <div className="text-lg text-gray-300 flex items-center justify-center gap-4">
-            Updated: {new Date(lastUpdate).toLocaleTimeString()}
-            {firebaseReady && isOnline ? (
-              <div className="flex items-center gap-2 bg-green-900 px-3 py-1 rounded-full text-sm">
-                <Database className="w-4 h-4" />
-                <Wifi className="w-4 h-4" />
-                Live Database
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 bg-yellow-900 px-3 py-1 rounded-full text-sm">
-                <WifiOff className="w-4 h-4" />
-                Offline
-              </div>
-            )}
-          </div>
+        </div>
 
-          {pagesCount > 1 && (
-            <div className="mt-3 flex items-center justify-center gap-3 text-sm text-gray-300">
-              <button
-                onClick={() => setDisplayPage((p) => (p - 1 + pagesCount) % pagesCount)}
-                className="px-2 py-1 bg-gray-700/60 rounded hover:bg-gray-700"
-                title="Previous screen"
-              >
-                <ChevronLeft className="w-4 h-4" />
-              </button>
-              <span>
-                Screen {displayPage + 1} of {pagesCount}
-              </span>
-              <button
-                onClick={() => setDisplayPage((p) => (p + 1) % pagesCount)}
-                className="px-2 py-1 bg-gray-700/60 rounded hover:bg-gray-700"
-                title="Next screen"
-              >
-                <ChevronRight className="w-4 h-4" />
-              </button>
+        <div className="text-lg text-gray-300 flex items-center justify-center gap-4 mb-6">
+          Updated: {new Date(lastUpdate).toLocaleTimeString()}
+          {firebaseReady && isOnline ? (
+            <div className="flex items-center gap-2 bg-green-900 px-3 py-1 rounded-full text-sm">
+              <Database className="w-4 h-4" />
+              <Wifi className="w-4 h-4" />
+              Live Database
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 bg-yellow-900 px-3 py-1 rounded-full text-sm">
+              <WifiOff className="w-4 h-4" />
+              Offline
             </div>
           )}
         </div>
+
+        {pagesCount > 1 && (
+          <div className="mt-3 flex items-center justify-center gap-3 text-sm text-gray-300">
+            <button
+              onClick={() => setDisplayPage((p) => (p - 1 + pagesCount) % pagesCount)}
+              className="px-2 py-1 bg-gray-700/60 rounded hover:bg-gray-700"
+              title="Previous screen"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <span>
+              Screen {displayPage + 1} of {pagesCount}
+            </span>
+            <button
+              onClick={() => setDisplayPage((p) => (p + 1) % pagesCount)}
+              className="px-2 py-1 bg-gray-700/60 rounded hover:bg-gray-700"
+              title="Next screen"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        )}
 
         {/* full-width grid */}
         <div className={`grid gap-8 w-full ${visibleTables.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
@@ -1240,6 +1604,14 @@ Start screen sharing now?`;
             </button>
 
             <button
+              onClick={() => setCurrentView('podium')}
+              className="bg-pink-600 hover:bg-pink-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
+            >
+              <Trophy className="w-5 h-5" />
+              Podium
+            </button>
+
+            <button
               onClick={showCastingOptions}
               className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
             >
@@ -1281,6 +1653,8 @@ Start screen sharing now?`;
     ? renderAdminView()
     : currentView === 'draw'
     ? renderDrawView()
+    : currentView === 'podium'
+    ? renderPodiumView()
     : renderDisplayView();
 };
 
