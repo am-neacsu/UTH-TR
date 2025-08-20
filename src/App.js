@@ -1647,7 +1647,7 @@ Start screen sharing now?`;
       <Inner />
     );
   };
-
+  
   // Choose view
   return currentView === 'admin'
     ? renderAdminView()
