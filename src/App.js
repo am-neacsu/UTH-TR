@@ -17,6 +17,8 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 
+import { LayoutGroup, motion } from 'framer-motion';
+
 import { initializeApp, getApps } from 'firebase/app';
 import {
   getFirestore,
@@ -59,6 +61,15 @@ const chunk = (arr, size) => {
   return out;
 };
 
+const shuffle = (arr) => {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
 // ===========================================================
 const PokerTournamentApp = () => {
   const [tables, setTables] = useState([]);
@@ -76,6 +87,21 @@ const PokerTournamentApp = () => {
   const [firebaseReady, setFirebaseReady] = useState(false);
   const [db, setDb] = useState(null);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+
+  // ===== Random Draw state & animation =====
+  const [participantsText, setParticipantsText] = useState('');
+  const [seatsPerTable, setSeatsPerTable] = useState(9);
+  const [startingChips, setStartingChips] = useState(0); // NEW: starting chips for draw save
+  const [autoSwitchToDisplay, setAutoSwitchToDisplay] = useState(true); // NEW: auto-open Live Display after animation
+
+  const [drawPhase, setDrawPhase] = useState('idle'); // idle | prepared | animating | done
+  const [participants, setParticipants] = useState([]); // [{id, name}]
+  const [preparedTables, setPreparedTables] = useState([]); // [{tableNumber, seats}]
+  const [seatTargets, setSeatTargets] = useState({}); // id -> {tableIdx, seat}
+  const [seatOccupants, setSeatOccupants] = useState({}); // `${tableIdx}-${seat}` -> participant id
+  const [animOrder, setAnimOrder] = useState([]); // ids in the order we animate
+  const [animIndex, setAnimIndex] = useState(0);
+  const animTimerRef = useRef(null);
 
   // ---------- init Firestore + live listener ----------
   useEffect(() => {
@@ -128,6 +154,8 @@ const PokerTournamentApp = () => {
         )[0]
       : null;
 
+    // If there is an in-play table, we keep the featured-first rotation logic.
+    // If **none** are in play (i.e., all waiting/finished), pagesCount will be computed later from sorted tables.
     const pagesCount = featured
       ? 1 + Math.ceil(Math.max(0, tables.length - 1) / 2)
       : Math.max(1, Math.ceil(tables.length / 2));
@@ -164,7 +192,7 @@ const PokerTournamentApp = () => {
       tableNumber: parseInt(newTable.tableNumber, 10),
       players: [...newTable.players],
       status: newTable.status,
-      inPlay: newTable.status === 'in_play', // legacy compatibility
+      inPlay: newTable.status === 'in_play',
       createdAt: new Date().toISOString(),
       lastUpdated: new Date().toISOString(),
     };
@@ -180,7 +208,7 @@ const PokerTournamentApp = () => {
 
   const addPlayerToNewTable = () => {
     const chipsNum = Number(newPlayer.chips || 0);
-    if (!newPlayer.name || chipsNum <= 0) return;
+    if (!newPlayer.name || chipsNum < 0) return;
     setNewTable((prev) => ({
       ...prev,
       players: [...prev.players, { name: newPlayer.name.trim(), chips: chipsNum }],
@@ -267,7 +295,7 @@ const PokerTournamentApp = () => {
     }
   };
 
-  // ---------- casting helpers (previously missing) ----------
+  // ---------- casting helpers ----------
   const startScreenShare = async () => {
     try {
       setCurrentView('display');
@@ -329,18 +357,190 @@ Start screen sharing now?`;
   })();
 
   // ---------- display page building ----------
-  const inPlayTables = tables.filter((t) => getStatus(t) === 'in_play');
-  const featured = inPlayTables.length
-    ? [...inPlayTables].sort(
-        (a, b) =>
-          new Date(b.lastUpdated || b.createdAt || 0) - new Date(a.lastUpdated || a.createdAt || 0)
-      )[0]
-    : null;
+  const anyInPlay = tables.some((t) => getStatus(t) === 'in_play');
 
-  const rest = featured ? tables.filter((t) => t.id !== featured.id) : tables;
-  const pages = featured ? [[featured], ...chunk(rest, 2)] : chunk(rest, 2);
+  // If none are in-play, sort by tableNumber asc; otherwise keep featured-first logic.
+  let featured = null;
+  let pages = [];
+  if (anyInPlay) {
+    const inPlayTables = tables.filter((t) => getStatus(t) === 'in_play');
+    featured = inPlayTables.length
+      ? [...inPlayTables].sort(
+          (a, b) =>
+            new Date(b.lastUpdated || b.createdAt || 0) - new Date(a.lastUpdated || a.createdAt || 0)
+        )[0]
+      : null;
+    const rest = featured ? tables.filter((t) => t.id !== featured.id) : tables;
+    pages = featured ? [[featured], ...chunk(rest, 2)] : chunk(rest, 2);
+  } else {
+    const sortedByNumber = [...tables].sort(
+      (a, b) => (parseInt(a.tableNumber || 0, 10)) - (parseInt(b.tableNumber || 0, 10))
+    );
+    pages = chunk(sortedByNumber, 2);
+  }
+
   const pagesCount = Math.max(1, pages.length);
   const visibleTables = pages[displayPage] || [];
+
+  // ===================== DRAW LOGIC =====================
+
+  const parseNames = (text) =>
+    text
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  const prepareDraw = () => {
+    const names = parseNames(participantsText);
+    if (!names.length) {
+      window.alert('Add at least one participant name.');
+      return;
+    }
+    if (seatsPerTable <= 0) {
+      window.alert('Seats per table must be greater than 0.');
+      return;
+    }
+
+    const base = names.map((name, i) => ({ id: `${name}-${i}`, name }));
+    const shuffled = shuffle(base);
+    const tCount = Math.ceil(shuffled.length / seatsPerTable);
+
+    const tablesPreview = Array.from({ length: tCount }, (_, idx) => ({
+      tableNumber: idx + 1,
+      seats: seatsPerTable,
+    }));
+
+    const targets = {};
+    shuffled.forEach((p, idx) => {
+      const tableIdx = Math.floor(idx / seatsPerTable);
+      const seat = (idx % seatsPerTable) + 1;
+      targets[p.id] = { tableIdx, seat };
+    });
+
+    setParticipants(base);
+    setPreparedTables(tablesPreview);
+    setSeatTargets(targets);
+    setSeatOccupants({});
+    setAnimOrder(shuffled.map((p) => p.id));
+    setAnimIndex(0);
+    setDrawPhase('prepared');
+  };
+
+  const startAnimation = () => {
+    if (drawPhase !== 'prepared') return;
+    setDrawPhase('animating');
+
+    animTimerRef.current = setInterval(() => {
+      setAnimIndex((i) => {
+        const next = i + 1;
+        const id = animOrder[i];
+        if (id) {
+          const t = seatTargets[id];
+          const key = `${t.tableIdx}-${t.seat}`;
+          setSeatOccupants((prev) => ({ ...prev, [key]: id }));
+        }
+        if (next >= animOrder.length) {
+          clearInterval(animTimerRef.current);
+          animTimerRef.current = null;
+          setDrawPhase('done');
+          if (autoSwitchToDisplay) {
+            // small pause so the last chip settles visually
+            setTimeout(() => setCurrentView('display'), 600);
+          }
+        }
+        return next;
+      });
+    }, 400);
+  };
+
+  const resetDraw = () => {
+    if (animTimerRef.current) {
+      clearInterval(animTimerRef.current);
+      animTimerRef.current = null;
+    }
+    setSeatOccupants({});
+    setAnimIndex(0);
+    setDrawPhase('prepared');
+  };
+
+  const clearDraw = () => {
+    if (animTimerRef.current) {
+      clearInterval(animTimerRef.current);
+      animTimerRef.current = null;
+    }
+    setParticipantsText('');
+    setParticipants([]);
+    setPreparedTables([]);
+    setSeatTargets({});
+    setSeatOccupants({});
+    setAnimOrder([]);
+    setAnimIndex(0);
+    setDrawPhase('idle');
+  };
+
+  const saveDrawToFirestore = async () => {
+    if (!db) {
+      window.alert('Database not ready.');
+      return;
+    }
+    if (drawPhase !== 'done') {
+      window.alert('Run the animation first, then save.');
+      return;
+    }
+
+    try {
+      // Build final tables from seatOccupants
+      const tCount = preparedTables.length;
+      const tablesOut = Array.from({ length: tCount }, (_, idx) => ({
+        tableNumber: idx + 1,
+        players: [],
+      }));
+
+      for (let idx = 0; idx < tCount; idx++) {
+        for (let seat = 1; seat <= seatsPerTable; seat++) {
+          const key = `${idx}-${seat}`;
+          const id = seatOccupants[key];
+          if (!id) continue;
+          const p = participants.find((x) => x.id === id);
+          if (!p) continue;
+          tablesOut[idx].players.push({ name: p.name, chips: Number(startingChips || 0), seat });
+        }
+      }
+
+      // wipe existing tables then write
+      let cursor = null;
+      while (true) {
+        const q = cursor
+          ? query(fsCollection(db, 'tables'), orderBy(documentId()), startAfter(cursor), limit(500))
+          : query(fsCollection(db, 'tables'), orderBy(documentId()), limit(500));
+
+        const snap = await getDocs(q);
+        if (snap.empty) break;
+
+        const batch = writeBatch(db);
+        snap.docs.forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+
+        cursor = snap.docs[snap.docs.length - 1].id;
+      }
+
+      for (const t of tablesOut) {
+        await addDoc(fsCollection(db, 'tables'), {
+          tableNumber: t.tableNumber,
+          players: t.players,
+          status: 'not_playing',
+          inPlay: false,
+          createdAt: new Date().toISOString(),
+          lastUpdated: new Date().toISOString(),
+        });
+      }
+
+      window.alert('Draw saved to Firestore.');
+    } catch (e) {
+      console.error('Save draw failed:', e);
+      window.alert(`Save failed: ${e.code || 'error'} — ${e.message || ''}`);
+    }
+  };
 
   // ---------- ADMIN VIEW ----------
   const renderAdminView = () => (
@@ -356,7 +556,7 @@ Start screen sharing now?`;
             </div>
           </h1>
 
-          <div className="flex gap-4 items-center">
+        <div className="flex gap-4 items-center">
             <div className="flex gap-2">
               <button
                 onClick={showCastingOptions}
@@ -382,6 +582,13 @@ Start screen sharing now?`;
             >
               <Monitor className="w-5 h-5" />
               View Display
+            </button>
+
+            <button
+              onClick={() => setCurrentView('draw')}
+              className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg text-white"
+            >
+              Random Draw
             </button>
 
             <button
@@ -453,8 +660,8 @@ Start screen sharing now?`;
                   type="number"
                   value={newPlayer.chips}
                   onChange={(e) => setNewPlayer((p) => ({ ...p, chips: e.target.value }))}
-                  className="w-24 p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-500 focus:outline-none"
-                  placeholder="Chips"
+                  className="w-32 p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-500 focus:outline-none"
+                  placeholder="starting chips"
                 />
                 <button onClick={addPlayerToNewTable} className="bg-blue-600 hover:bg-blue-700 p-2 rounded transition-colors">
                   <Plus className="w-4 h-4" />
@@ -466,7 +673,7 @@ Start screen sharing now?`;
                   <div key={index} className="flex justify-between items-center bg-gray-700 p-2 rounded text-sm">
                     <span>{player.name}</span>
                     <div className="flex items-center gap-2">
-                      <span className="text-green-400">${player.chips.toLocaleString()}</span>
+                      <span className="text-green-400">{player.chips.toLocaleString()} chips</span>
                       <button onClick={() => removePlayerFromNewTable(index)} className="text-red-400 hover:text-red-300">
                         <X className="w-4 h-4" />
                       </button>
@@ -524,20 +731,26 @@ Start screen sharing now?`;
                 </div>
 
                 <div className="space-y-3">
-                  {table.players?.map((player, playerIndex) => (
-                    <div key={playerIndex} className="flex justify-between items-center bg-gray-700 p-3 rounded">
-                      <span className="font-medium">{player.name}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm text-gray-400">$</span>
-                        <input
-                          type="number"
-                          value={player.chips}
-                          onChange={(e) => updatePlayerChips(table.id, playerIndex, e.target.value)}
-                          className="w-20 p-1 bg-gray-600 border border-gray-500 rounded text-right focus:border-blue-500 focus:outline-none"
-                        />
+                  {table.players?.map((player, playerIndex) => {
+                    const seatLabel = player.seat ?? playerIndex + 1;
+                    return (
+                      <div key={playerIndex} className="flex justify-between items-center bg-gray-700 p-3 rounded">
+                        <span className="font-medium">
+                          <span className="text-gray-400 mr-2">Seat {seatLabel}</span>
+                          {player.name}
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="number"
+                            value={player.chips}
+                            onChange={(e) => updatePlayerChips(table.id, playerIndex, e.target.value)}
+                            className="w-24 p-1 bg-gray-600 border border-gray-500 rounded text-right focus:border-blue-500 focus:outline-none"
+                          />
+                          <span className="text-sm text-gray-300">chips</span>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             );
@@ -547,15 +760,231 @@ Start screen sharing now?`;
     </div>
   );
 
+  // ---------- DRAW VIEW ----------
+  const renderDrawView = () => {
+    const tCount = preparedTables.length;
+
+    return (
+      <div className="min-h-screen bg-gray-900 text-white p-6">
+        <div className="max-w-7xl mx-auto">
+          <div className="flex items-center justify-between mb-6">
+            <h1 className="text-3xl font-bold text-blue-400 flex items-center gap-3">
+              <Settings className="w-7 h-7" />
+              Random Draw
+            </h1>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setCurrentView('admin')}
+                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
+              >
+                Back to Admin
+              </button>
+              <button
+                onClick={() => setCurrentView('display')}
+                className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg"
+              >
+                View Display
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            {/* Left: Inputs */}
+            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+              <h2 className="text-lg font-semibold mb-3">Participants</h2>
+              <textarea
+                value={participantsText}
+                onChange={(e) => setParticipantsText(e.target.value)}
+                placeholder="One name per line"
+                className="w-full h-64 p-3 bg-gray-700 border border-gray-600 rounded outline-none resize-y"
+              />
+
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm mb-1">Seats per table</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={seatsPerTable}
+                    onChange={(e) => setSeatsPerTable(parseInt(e.target.value || '0', 10))}
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm mb-1">Starting Chips</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={startingChips}
+                    onChange={(e) => setStartingChips(parseInt(e.target.value || '0', 10))}
+                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                  />
+                </div>
+              </div>
+
+              <div className="mt-3">
+                <label className="inline-flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={autoSwitchToDisplay}
+                    onChange={(e) => setAutoSwitchToDisplay(e.target.checked)}
+                    className="w-4 h-4"
+                  />
+                  Auto-open Live Display when done
+                </label>
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-3">
+                <button
+                  onClick={prepareDraw}
+                  className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg"
+                >
+                  Prepare
+                </button>
+                <button
+                  onClick={startAnimation}
+                  disabled={drawPhase !== 'prepared'}
+                  className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+                >
+                  Start Animation
+                </button>
+                <button
+                  onClick={resetDraw}
+                  disabled={drawPhase === 'idle'}
+                  className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+                >
+                  Reset
+                </button>
+                <button
+                  onClick={clearDraw}
+                  className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
+                >
+                  Clear
+                </button>
+                <button
+                  onClick={saveDrawToFirestore}
+                  disabled={drawPhase !== 'done'}
+                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg ml-auto"
+                >
+                  Save to Firestore
+                </button>
+              </div>
+
+              <div className="mt-3 text-gray-300 text-sm">
+                Status:&nbsp;
+                {drawPhase === 'idle' && 'Idle'}
+                {drawPhase === 'prepared' && 'Ready to animate'}
+                {drawPhase === 'animating' && 'Animating…'}
+                {drawPhase === 'done' && 'Done'}
+              </div>
+            </div>
+
+            {/* Middle: Name pool */}
+            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+              <h2 className="text-lg font-semibold mb-3">Name Pool</h2>
+              <p className="text-sm text-gray-400 mb-3">
+                All names start here. Click <span className="text-gray-200 font-medium">Start Animation</span> to fly them to seats.
+              </p>
+              <LayoutGroup>
+                <div className="min-h-[16rem] grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {participants
+                    .filter((p) => !Object.values(seatOccupants).includes(p.id))
+                    .map((p) => (
+                      <motion.div
+                        key={p.id}
+                        layoutId={p.id}
+                        layout
+                        className="px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-sm text-white shadow"
+                        transition={{ type: 'spring', stiffness: 500, damping: 38 }}
+                      >
+                        {p.name}
+                      </motion.div>
+                    ))}
+                  {!participants.length && (
+                    <div className="text-gray-400 text-sm">Paste names and click Prepare.</div>
+                  )}
+                </div>
+              </LayoutGroup>
+            </div>
+
+            {/* Right: Tables preview and target seats */}
+            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+              <h2 className="text-lg font-semibold mb-3">
+                Tables {tCount ? `(auto: ${tCount})` : ''}
+              </h2>
+              <LayoutGroup>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {preparedTables.map((t, tIdx) => (
+                    <div
+                      key={t.tableNumber}
+                      className="rounded-xl border border-gray-600 bg-gray-900/60 p-4"
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="text-blue-300 font-semibold">Table {t.tableNumber}</div>
+                        <div className="text-xs text-gray-400">
+                          {Array.from({ length: seatsPerTable }).filter((_, seat) =>
+                            seatOccupants[`${tIdx}-${seat + 1}`]
+                          ).length}{' '}
+                          / {seatsPerTable}
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        {Array.from({ length: seatsPerTable }).map((_, i) => {
+                          const seat = i + 1;
+                          const key = `${tIdx}-${seat}`;
+                          const occId = seatOccupants[key];
+                          const occ = participants.find((p) => p.id === occId);
+
+                          return (
+                            <div
+                              key={key}
+                              className="relative h-10 rounded-md border border-dashed border-gray-600 bg-gray-800/60 flex items-center justify-between px-2"
+                            >
+                              <span className="text-xs text-gray-300">Seat {seat}</span>
+                              {occ && (
+                                <motion.div
+                                  layoutId={occ.id}
+                                  layout
+                                  className="absolute inset-0 flex items-center justify-center"
+                                  transition={{ type: 'spring', stiffness: 500, damping: 38 }}
+                                >
+                                  <div className="px-3 py-1 rounded bg-gray-200 text-gray-900 text-sm font-medium">
+                                    {occ.name}
+                                  </div>
+                                </motion.div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {drawPhase === 'idle' && (
+                  <div className="text-gray-400 text-sm mt-4">
+                    After you click <span className="text-gray-200 font-medium">Prepare</span>,
+                    empty tables will appear here.
+                  </div>
+                )}
+              </LayoutGroup>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   // ---------- DISPLAY VIEW ----------
   const renderDisplayView = () => (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 text-white p-8">
       <div className="max-w-7xl mx-auto">
         <div className="text-center mb-8">
-                    <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400 mb-3">
+          <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400 mb-3">
             Ultimate Texas Hold&apos;em Tournament
           </h1>
-        <div className="text-lg text-gray-300 flex items-center justify-center gap-4">
+          <div className="text-lg text-gray-300 flex items-center justify-center gap-4">
             Updated: {new Date(lastUpdate).toLocaleTimeString()}
             {firebaseReady && isOnline ? (
               <div className="flex items-center gap-2 bg-green-900 px-3 py-1 rounded-full text-sm">
@@ -598,6 +1027,12 @@ Start screen sharing now?`;
           {visibleTables.map((table) => {
             const st = getStatus(table);
             const badge = statusBadge(st);
+
+            // sort players by chips desc for display; tie-break by seat
+            const playersSorted = [...(table.players || [])].sort(
+              (a, b) => (b.chips || 0) - (a.chips || 0) || (a.seat || 0) - (b.seat || 0)
+            );
+
             return (
               <div
                 key={table.id}
@@ -615,32 +1050,37 @@ Start screen sharing now?`;
 
                 <div className="p-8">
                   <div className="text-center mb-6">
-                    
                     <h2 className="text-4xl font-bold text-white mb-2">TABLE {table.tableNumber}</h2>
                     <div className="text-lg text-gray-300">
-                      {table.players?.length || 0} Player{(table.players?.length || 0) !== 1 ? 's' : ''}
+                      {playersSorted.length} Player{playersSorted.length !== 1 ? 's' : ''}
                     </div>
                   </div>
 
                   <div className="space-y-4">
-                    {table.players?.map((player, index) => (
-                      <div key={index} className="bg-black/30 backdrop-blur-sm rounded-lg p-4">
-                        <div className="flex justify-between items-center">
-                          <div>
-                            <div className="text-xl font-bold text-white">{player.name}</div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-2xl font-bold text-green-400">
-                              ${player.chips.toLocaleString()}
+                    {playersSorted.map((player, index) => {
+                      const seatLabel = player.seat ?? index + 1;
+                      return (
+                        <div key={`${player.name}-${seatLabel}`} className="bg-black/30 backdrop-blur-sm rounded-lg p-4">
+                          <div className="flex justify-between items-center">
+                            <div>
+                              <div className="text-xl font-bold text-white">
+                                <span className="text-gray-300 mr-3 text-base">Seat {seatLabel}</span>
+                                {player.name}
+                              </div>
                             </div>
-                            <div className="text-sm text-gray-400">chips</div>
+                            <div className="text-right">
+                              <div className="text-2xl font-bold text-green-400">
+                                {Number(player.chips || 0).toLocaleString()}
+                              </div>
+                              <div className="text-sm text-gray-400">chips</div>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
 
-                  {(!table.players || table.players.length === 0) && (
+                  {(!playersSorted.length) && (
                     <div className="text-center py-8 text-gray-400">
                       <Users className="w-12 h-12 mx-auto mb-2 opacity-50" />
                       <div>No players assigned</div>
@@ -681,7 +1121,12 @@ Start screen sharing now?`;
     </div>
   );
 
-  return currentView === 'admin' ? renderAdminView() : renderDisplayView();
+  // Choose view
+  return currentView === 'admin'
+    ? renderAdminView()
+    : currentView === 'draw'
+    ? renderDrawView()
+    : renderDisplayView();
 };
 
 export default PokerTournamentApp;
