@@ -46,6 +46,53 @@ const firebaseConfig = {
   appId: '1:146461312885:web:13640c72d6c80967b6353c',
 };
 
+// -------- Animation pacing (ms per name) --------
+const DRAW_STEP_MS = 1000;
+
+/** Fit children to viewport (no scroll), center them, and paint the whole screen. */
+const FitToViewport = ({ children, bgClass = 'bg-gray-900' }) => {
+  const outerRef = useRef(null);
+  const innerRef = useRef(null);
+  const [scale, setScale] = useState(1);
+
+  useEffect(() => {
+    const update = () => {
+      const outer = outerRef.current;
+      const inner = innerRef.current;
+      if (!outer || !inner) return;
+
+      const ow = outer.clientWidth;
+      const oh = outer.clientHeight;
+      const iw = inner.scrollWidth || inner.clientWidth || 1;
+      const ih = inner.scrollHeight || inner.clientHeight || 1;
+
+      const s = Math.min(1, ow / iw, oh / ih) * 0.98; // 2% margin
+      setScale(Number.isFinite(s) ? s : 1);
+    };
+
+    const ro = new ResizeObserver(update);
+    ro.observe(document.documentElement);
+    if (outerRef.current) ro.observe(outerRef.current);
+    if (innerRef.current) ro.observe(innerRef.current);
+    update();
+    return () => ro.disconnect();
+  }, []);
+
+  return (
+    <div
+      ref={outerRef}
+      className={`w-screen h-screen overflow-hidden ${bgClass} flex items-start justify-center`}
+    >
+      <div
+        ref={innerRef}
+        style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+};
+
 // ---------- helpers ----------
 const getStatus = (t) => (t?.status ? t.status : t?.inPlay ? 'in_play' : 'not_playing');
 
@@ -91,8 +138,8 @@ const PokerTournamentApp = () => {
   // ===== Random Draw state & animation =====
   const [participantsText, setParticipantsText] = useState('');
   const [seatsPerTable, setSeatsPerTable] = useState(9);
-  const [startingChips, setStartingChips] = useState(0); // NEW: starting chips for draw save
-  const [autoSwitchToDisplay, setAutoSwitchToDisplay] = useState(true); // NEW: auto-open Live Display after animation
+  const [startingChips, setStartingChips] = useState(0);
+  const [autoSwitchToDisplay, setAutoSwitchToDisplay] = useState(true);
 
   const [drawPhase, setDrawPhase] = useState('idle'); // idle | prepared | animating | done
   const [participants, setParticipants] = useState([]); // [{id, name}]
@@ -102,6 +149,11 @@ const PokerTournamentApp = () => {
   const [animOrder, setAnimOrder] = useState([]); // ids in the order we animate
   const [animIndex, setAnimIndex] = useState(0);
   const animTimerRef = useRef(null);
+
+  // Presentation mode + fit + HUD visibility
+  const [drawPresentation, setDrawPresentation] = useState(false);
+  const [fitToScreen, setFitToScreen] = useState(true);
+  const [hudVisible, setHudVisible] = useState(true);
 
   // ---------- init Firestore + live listener ----------
   useEffect(() => {
@@ -144,6 +196,18 @@ const PokerTournamentApp = () => {
     };
   }, []);
 
+  // Ctrl+Space toggles HUD (presentation or display)
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.code === 'Space') {
+        e.preventDefault();
+        setHudVisible((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   // ---------- auto-rotate display pages every 20s ----------
   useEffect(() => {
     const inPlayTables = tables.filter((t) => getStatus(t) === 'in_play');
@@ -154,8 +218,6 @@ const PokerTournamentApp = () => {
         )[0]
       : null;
 
-    // If there is an in-play table, we keep the featured-first rotation logic.
-    // If **none** are in play (i.e., all waiting/finished), pagesCount will be computed later from sorted tables.
     const pagesCount = featured
       ? 1 + Math.ceil(Math.max(0, tables.length - 1) / 2)
       : Math.max(1, Math.ceil(tables.length / 2));
@@ -359,7 +421,6 @@ Start screen sharing now?`;
   // ---------- display page building ----------
   const anyInPlay = tables.some((t) => getStatus(t) === 'in_play');
 
-  // If none are in-play, sort by tableNumber asc; otherwise keep featured-first logic.
   let featured = null;
   let pages = [];
   if (anyInPlay) {
@@ -374,7 +435,7 @@ Start screen sharing now?`;
     pages = featured ? [[featured], ...chunk(rest, 2)] : chunk(rest, 2);
   } else {
     const sortedByNumber = [...tables].sort(
-      (a, b) => (parseInt(a.tableNumber || 0, 10)) - (parseInt(b.tableNumber || 0, 10))
+      (a, b) => parseInt(a.tableNumber || 0, 10) - parseInt(b.tableNumber || 0, 10)
     );
     pages = chunk(sortedByNumber, 2);
   }
@@ -426,65 +487,14 @@ Start screen sharing now?`;
     setDrawPhase('prepared');
   };
 
-  const startAnimation = () => {
-    if (drawPhase !== 'prepared') return;
-    setDrawPhase('animating');
-
-    animTimerRef.current = setInterval(() => {
-      setAnimIndex((i) => {
-        const next = i + 1;
-        const id = animOrder[i];
-        if (id) {
-          const t = seatTargets[id];
-          const key = `${t.tableIdx}-${t.seat}`;
-          setSeatOccupants((prev) => ({ ...prev, [key]: id }));
-        }
-        if (next >= animOrder.length) {
-          clearInterval(animTimerRef.current);
-          animTimerRef.current = null;
-          setDrawPhase('done');
-          if (autoSwitchToDisplay) {
-            // small pause so the last chip settles visually
-            setTimeout(() => setCurrentView('display'), 600);
-          }
-        }
-        return next;
-      });
-    }, 400);
-  };
-
-  const resetDraw = () => {
-    if (animTimerRef.current) {
-      clearInterval(animTimerRef.current);
-      animTimerRef.current = null;
-    }
-    setSeatOccupants({});
-    setAnimIndex(0);
-    setDrawPhase('prepared');
-  };
-
-  const clearDraw = () => {
-    if (animTimerRef.current) {
-      clearInterval(animTimerRef.current);
-      animTimerRef.current = null;
-    }
-    setParticipantsText('');
-    setParticipants([]);
-    setPreparedTables([]);
-    setSeatTargets({});
-    setSeatOccupants({});
-    setAnimOrder([]);
-    setAnimIndex(0);
-    setDrawPhase('idle');
-  };
-
-  const saveDrawToFirestore = async () => {
+  // Save function supports {silent:true} to suppress alerts (used by auto-open)
+  const saveDrawToFirestore = async ({ silent = false } = {}) => {
     if (!db) {
-      window.alert('Database not ready.');
+      if (!silent) window.alert('Database not ready.');
       return;
     }
     if (drawPhase !== 'done') {
-      window.alert('Run the animation first, then save.');
+      if (!silent) window.alert('Run the animation first, then save.');
       return;
     }
 
@@ -535,11 +545,66 @@ Start screen sharing now?`;
         });
       }
 
-      window.alert('Draw saved to Firestore.');
+      if (!silent) window.alert('Draw saved to Firestore.');
     } catch (e) {
       console.error('Save draw failed:', e);
-      window.alert(`Save failed: ${e.code || 'error'} — ${e.message || ''}`);
+      if (!silent) window.alert(`Save failed: ${e.code || 'error'} — ${e.message || ''}`);
     }
+  };
+
+  const startAnimation = () => {
+    if (drawPhase !== 'prepared') return;
+    setDrawPhase('animating');
+
+    animTimerRef.current = setInterval(() => {
+      setAnimIndex((i) => {
+        const next = i + 1;
+        const id = animOrder[i];
+        if (id) {
+          const t = seatTargets[id];
+          const key = `${t.tableIdx}-${t.seat}`;
+          setSeatOccupants((prev) => ({ ...prev, [key]: id }));
+        }
+        if (next >= animOrder.length) {
+          clearInterval(animTimerRef.current);
+          animTimerRef.current = null;
+          setDrawPhase('done');
+
+          if (autoSwitchToDisplay) {
+            (async () => {
+              await saveDrawToFirestore({ silent: true });
+              setTimeout(() => setCurrentView('display'), 400);
+            })();
+          }
+        }
+        return next;
+      });
+    }, DRAW_STEP_MS);
+  };
+
+  const resetDraw = () => {
+    if (animTimerRef.current) {
+      clearInterval(animTimerRef.current);
+      animTimerRef.current = null;
+    }
+    setSeatOccupants({});
+    setAnimIndex(0);
+    setDrawPhase('prepared');
+  };
+
+  const clearDraw = () => {
+    if (animTimerRef.current) {
+      clearInterval(animTimerRef.current);
+      animTimerRef.current = null;
+    }
+    setParticipantsText('');
+    setParticipants([]);
+    setPreparedTables([]);
+    setSeatTargets({});
+    setSeatOccupants({});
+    setAnimOrder([]);
+    setAnimIndex(0);
+    setDrawPhase('idle');
   };
 
   // ---------- ADMIN VIEW ----------
@@ -556,7 +621,7 @@ Start screen sharing now?`;
             </div>
           </h1>
 
-        <div className="flex gap-4 items-center">
+          <div className="flex gap-4 items-center">
             <div className="flex gap-2">
               <button
                 onClick={showCastingOptions}
@@ -764,32 +829,39 @@ Start screen sharing now?`;
   const renderDrawView = () => {
     const tCount = preparedTables.length;
 
-    return (
-      <div className="min-h-screen bg-gray-900 text-white p-6">
-        <div className="max-w-7xl mx-auto">
-          <div className="flex items-center justify-between mb-6">
-            <h1 className="text-3xl font-bold text-blue-400 flex items-center gap-3">
-              <Settings className="w-7 h-7" />
-              Random Draw
-            </h1>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setCurrentView('admin')}
-                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
-              >
-                Back to Admin
-              </button>
-              <button
-                onClick={() => setCurrentView('display')}
-                className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg"
-              >
-                View Display
-              </button>
-            </div>
+    const Inner = () => (
+      <div className="min-h-screen text-white p-6 w-full">
+        {/* header */}
+        <div className="flex items-center justify-between mb-6">
+          <h1 className="text-3xl font-bold text-blue-400 flex items-center gap-3">
+            <Settings className="w-7 h-7" />
+            Random Draw
+          </h1>
+          <div className="flex gap-3">
+            <button
+              onClick={() => setDrawPresentation((v) => !v)}
+              className="bg-slate-600 hover:bg-slate-700 px-4 py-2 rounded-lg"
+            >
+              {drawPresentation ? 'Exit Presentation' : 'Presentation Mode'}
+            </button>
+            <button
+              onClick={() => setCurrentView('admin')}
+              className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
+            >
+              Back to Admin
+            </button>
+            <button
+              onClick={() => setCurrentView('display')}
+              className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg"
+            >
+              View Display
+            </button>
           </div>
+        </div>
 
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-            {/* Left: Inputs */}
+        <div className={`grid grid-cols-1 ${drawPresentation ? 'xl:grid-cols-2' : 'xl:grid-cols-3'} gap-6`}>
+          {/* Left: Inputs (hidden in presentation mode) */}
+          {!drawPresentation && (
             <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
               <h2 className="text-lg font-semibold mb-3">Participants</h2>
               <textarea
@@ -862,7 +934,7 @@ Start screen sharing now?`;
                   Clear
                 </button>
                 <button
-                  onClick={saveDrawToFirestore}
+                  onClick={() => saveDrawToFirestore({ silent: false })}
                   disabled={drawPhase !== 'done'}
                   className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg ml-auto"
                 >
@@ -878,113 +950,165 @@ Start screen sharing now?`;
                 {drawPhase === 'done' && 'Done'}
               </div>
             </div>
+          )}
 
-            {/* Middle: Name pool */}
-            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
-              <h2 className="text-lg font-semibold mb-3">Name Pool</h2>
-              <p className="text-sm text-gray-400 mb-3">
-                All names start here. Click <span className="text-gray-200 font-medium">Start Animation</span> to fly them to seats.
-              </p>
-              <LayoutGroup>
-                <div className="min-h-[16rem] grid grid-cols-2 sm:grid-cols-3 gap-2">
-                  {participants
-                    .filter((p) => !Object.values(seatOccupants).includes(p.id))
-                    .map((p) => (
-                      <motion.div
-                        key={p.id}
-                        layoutId={p.id}
-                        layout
-                        className="px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-sm text-white shadow"
-                        transition={{ type: 'spring', stiffness: 500, damping: 38 }}
-                      >
-                        {p.name}
-                      </motion.div>
-                    ))}
-                  {!participants.length && (
-                    <div className="text-gray-400 text-sm">Paste names and click Prepare.</div>
-                  )}
-                </div>
-              </LayoutGroup>
-            </div>
-
-            {/* Right: Tables preview and target seats */}
-            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
-              <h2 className="text-lg font-semibold mb-3">
-                Tables {tCount ? `(auto: ${tCount})` : ''}
-              </h2>
-              <LayoutGroup>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {preparedTables.map((t, tIdx) => (
-                    <div
-                      key={t.tableNumber}
-                      className="rounded-xl border border-gray-600 bg-gray-900/60 p-4"
+          {/* Middle: Name pool */}
+          <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+            <h2 className="text-lg font-semibold mb-3">Name Pool</h2>
+            <p className="text-sm text-gray-400 mb-3">
+              All names start here. Click <span className="text-gray-200 font-medium">Start Animation</span> to fly them to seats.
+            </p>
+            <LayoutGroup>
+              <div className="min-h-[16rem] grid grid-cols-2 sm:grid-cols-3 gap-2">
+                {participants
+                  .filter((p) => !Object.values(seatOccupants).includes(p.id))
+                  .map((p) => (
+                    <motion.div
+                      key={p.id}
+                      layoutId={p.id}
+                      layout
+                      className="px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-sm text-white shadow"
+                      transition={{ type: 'spring', stiffness: 500, damping: 38 }}
                     >
-                      <div className="flex items-center justify-between mb-3">
-                        <div className="text-blue-300 font-semibold">Table {t.tableNumber}</div>
-                        <div className="text-xs text-gray-400">
-                          {Array.from({ length: seatsPerTable }).filter((_, seat) =>
-                            seatOccupants[`${tIdx}-${seat + 1}`]
-                          ).length}{' '}
-                          / {seatsPerTable}
-                        </div>
-                      </div>
+                      {p.name}
+                    </motion.div>
+                  ))}
+                {!participants.length && (
+                  <div className="text-gray-400 text-sm">Paste names and click Prepare.</div>
+                )}
+              </div>
+            </LayoutGroup>
+          </div>
 
-                      <div className="grid grid-cols-2 gap-2">
-                        {Array.from({ length: seatsPerTable }).map((_, i) => {
-                          const seat = i + 1;
-                          const key = `${tIdx}-${seat}`;
-                          const occId = seatOccupants[key];
-                          const occ = participants.find((p) => p.id === occId);
-
-                          return (
-                            <div
-                              key={key}
-                              className="relative h-10 rounded-md border border-dashed border-gray-600 bg-gray-800/60 flex items-center justify-between px-2"
-                            >
-                              <span className="text-xs text-gray-300">Seat {seat}</span>
-                              {occ && (
-                                <motion.div
-                                  layoutId={occ.id}
-                                  layout
-                                  className="absolute inset-0 flex items-center justify-center"
-                                  transition={{ type: 'spring', stiffness: 500, damping: 38 }}
-                                >
-                                  <div className="px-3 py-1 rounded bg-gray-200 text-gray-900 text-sm font-medium">
-                                    {occ.name}
-                                  </div>
-                                </motion.div>
-                              )}
-                            </div>
-                          );
-                        })}
+          {/* Right: Tables preview */}
+          <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+            <h2 className="text-lg font-semibold mb-3">
+              Tables {tCount ? `(auto: ${tCount})` : ''}
+            </h2>
+            <LayoutGroup>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {preparedTables.map((t, tIdx) => (
+                  <div
+                    key={t.tableNumber}
+                    className="rounded-xl border border-gray-600 bg-gray-900/60 p-4"
+                  >
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-blue-300 font-semibold">Table {t.tableNumber}</div>
+                      <div className="text-xs text-gray-400">
+                        {Array.from({ length: seatsPerTable }).filter((_, seat) =>
+                          seatOccupants[`${tIdx}-${seat + 1}`]
+                        ).length}{' '}
+                        / {seatsPerTable}
                       </div>
                     </div>
-                  ))}
-                </div>
 
-                {drawPhase === 'idle' && (
-                  <div className="text-gray-400 text-sm mt-4">
-                    After you click <span className="text-gray-200 font-medium">Prepare</span>,
-                    empty tables will appear here.
+                    <div className="grid grid-cols-2 gap-2">
+                      {Array.from({ length: seatsPerTable }).map((_, i) => {
+                        const seat = i + 1;
+                        const key = `${tIdx}-${seat}`;
+                        const occId = seatOccupants[key];
+                        const occ = participants.find((p) => p.id === occId);
+
+                        return (
+                          <div
+                            key={key}
+                            className="relative h-10 rounded-md border border-dashed border-gray-600 bg-gray-800/60 flex items-center justify-between px-2"
+                          >
+                            <span className="text-xs text-gray-300">Seat {seat}</span>
+                            {occ && (
+                              <motion.div
+                                layoutId={occ.id}
+                                layout
+                                className="absolute inset-0 flex items-center justify-center"
+                                transition={{ type: 'spring', stiffness: 500, damping: 38 }}
+                              >
+                                <div className="px-3 py-1 rounded bg-gray-200 text-gray-900 text-sm font-medium">
+                                  {occ.name}
+                                </div>
+                              </motion.div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                )}
-              </LayoutGroup>
-            </div>
+                ))}
+              </div>
+
+              {drawPhase === 'idle' && (
+                <div className="text-gray-400 text-sm mt-4">
+                  After you click <span className="text-gray-200 font-medium">Prepare</span>,
+                  empty tables will appear here.
+                </div>
+              )}
+            </LayoutGroup>
           </div>
         </div>
+
+        {/* Floating controls in presentation mode (Ctrl+Space toggles visibility) */}
+        {drawPresentation && hudVisible && (
+          <div className="fixed bottom-6 right-6 flex items-center gap-2">
+            <button
+              onClick={startAnimation}
+              disabled={drawPhase !== 'prepared'}
+              className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+            >
+              Start
+            </button>
+            <button
+              onClick={resetDraw}
+              disabled={drawPhase === 'idle'}
+              className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+            >
+              Reset
+            </button>
+            <button
+              onClick={() => saveDrawToFirestore({ silent: false })}
+              disabled={drawPhase !== 'done'}
+              className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+            >
+              Save
+            </button>
+
+            {/* small fit toggle */}
+            <div className="ml-3 text-xs text-gray-200 bg-gray-800/80 px-2 py-1 rounded">
+              Fit:{' '}
+              <button
+                className="underline"
+                onClick={() => setFitToScreen((v) => !v)}
+                title="Toggle fit-to-screen"
+              >
+                {fitToScreen ? 'On' : 'Off'}
+              </button>
+              <span className="ml-2 opacity-70">Ctrl+Space hides HUD</span>
+            </div>
+          </div>
+        )}
       </div>
+    );
+
+    // Scale only in presentation (no scroll on stage)
+    return drawPresentation && fitToScreen ? (
+      <FitToViewport bgClass="bg-gray-900">
+        <div className="w-[100vw]">
+          <Inner />
+        </div>
+      </FitToViewport>
+    ) : (
+      <Inner />
     );
   };
 
   // ---------- DISPLAY VIEW ----------
-  const renderDisplayView = () => (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 text-white p-8">
-      <div className="max-w-7xl mx-auto">
+  const renderDisplayView = () => {
+    const Inner = () => (
+      <div className="min-h-screen text-white p-8 w-full">
+        {/* header */}
         <div className="text-center mb-8">
           <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400 mb-3">
             Ultimate Texas Hold&apos;em Tournament
           </h1>
-          <div className="text-lg text-gray-300 flex items-center justify-center gap-4">
+        <div className="text-lg text-gray-300 flex items-center justify-center gap-4">
             Updated: {new Date(lastUpdate).toLocaleTimeString()}
             {firebaseReady && isOnline ? (
               <div className="flex items-center gap-2 bg-green-900 px-3 py-1 rounded-full text-sm">
@@ -1023,7 +1147,8 @@ Start screen sharing now?`;
           )}
         </div>
 
-        <div className={`grid gap-8 ${visibleTables.length === 1 ? 'grid-cols-1 max-w-3xl mx-auto' : 'grid-cols-1 md:grid-cols-2'}`}>
+        {/* full-width grid */}
+        <div className={`grid gap-8 w-full ${visibleTables.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
           {visibleTables.map((table) => {
             const st = getStatus(table);
             const badge = statusBadge(st);
@@ -1060,7 +1185,10 @@ Start screen sharing now?`;
                     {playersSorted.map((player, index) => {
                       const seatLabel = player.seat ?? index + 1;
                       return (
-                        <div key={`${player.name}-${seatLabel}`} className="bg-black/30 backdrop-blur-sm rounded-lg p-4">
+                        <div
+                          key={`${player.name}-${seatLabel}`}
+                          className="bg-black/30 backdrop-blur-sm rounded-lg p-4"
+                        >
                           <div className="flex justify-between items-center">
                             <div>
                               <div className="text-xl font-bold text-white">
@@ -1080,7 +1208,7 @@ Start screen sharing now?`;
                     })}
                   </div>
 
-                  {(!playersSorted.length) && (
+                  {!playersSorted.length && (
                     <div className="text-center py-8 text-gray-400">
                       <Users className="w-12 h-12 mx-auto mb-2 opacity-50" />
                       <div>No players assigned</div>
@@ -1100,26 +1228,53 @@ Start screen sharing now?`;
           </div>
         )}
 
-        <div className="fixed bottom-6 left-6 flex gap-3">
-          <button
-            onClick={() => setCurrentView('admin')}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
-          >
-            <Settings className="w-5 h-5" />
-            Admin Panel
-          </button>
+        {/* Display HUD (Ctrl+Space toggles visibility) */}
+        {hudVisible && (
+          <div className="fixed bottom-6 left-6 flex items-center gap-3">
+            <button
+              onClick={() => setCurrentView('admin')}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
+            >
+              <Settings className="w-5 h-5" />
+              Admin Panel
+            </button>
 
-          <button
-            onClick={showCastingOptions}
-            className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
-          >
-            <Cast className="w-5 h-5" />
-            Cast Options
-          </button>
-        </div>
+            <button
+              onClick={showCastingOptions}
+              className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
+            >
+              <Cast className="w-5 h-5" />
+              Cast Options
+            </button>
+
+            {/* small fit toggle */}
+            <div className="ml-3 text-xs text-gray-200 bg-gray-800/80 px-2 py-1 rounded">
+              Fit:{' '}
+              <button
+                className="underline"
+                onClick={() => setFitToScreen((v) => !v)}
+                title="Toggle fit-to-screen"
+              >
+                {fitToScreen ? 'On' : 'Off'}
+              </button>
+              <span className="ml-2 opacity-70">Ctrl+Space hides HUD</span>
+            </div>
+          </div>
+        )}
       </div>
-    </div>
-  );
+    );
+
+    // Always fit on Display for TVs
+    return fitToScreen ? (
+      <FitToViewport bgClass="bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900">
+        <div className="w-[100vw]">
+          <Inner />
+        </div>
+      </FitToViewport>
+    ) : (
+      <Inner />
+    );
+  };
 
   // Choose view
   return currentView === 'admin'
