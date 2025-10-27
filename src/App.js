@@ -17,6 +17,9 @@ import {
   CheckCircle2,
   Trophy,
   Download,
+  Lock,
+  LogIn,
+  LogOut,
 } from 'lucide-react';
 
 import { LayoutGroup, motion } from 'framer-motion';
@@ -32,14 +35,19 @@ import {
   deleteDoc,
   getDocs,
   writeBatch,
-  query,
+  query,            // Firestore query()
   orderBy,
   startAfter,
   limit,
   documentId,
 } from 'firebase/firestore';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged,
+} from 'firebase/auth';
 
-// Excel export
 import * as XLSX from 'xlsx';
 
 const firebaseConfig = {
@@ -71,7 +79,7 @@ const FitToViewport = ({ children, bgClass = 'bg-gray-900' }) => {
       const iw = inner.scrollWidth || inner.clientWidth || 1;
       const ih = inner.scrollHeight || inner.clientHeight || 1;
 
-      const s = Math.min(1, ow / iw, oh / ih) * 0.98; // 2% margin
+      const s = Math.min(1, ow / iw, oh / ih) * 0.98; // margin
       setScale(Number.isFinite(s) ? s : 1);
     };
 
@@ -84,14 +92,8 @@ const FitToViewport = ({ children, bgClass = 'bg-gray-900' }) => {
   }, []);
 
   return (
-    <div
-      ref={outerRef}
-      className={`w-screen h-screen overflow-hidden ${bgClass} flex items-start justify-center`}
-    >
-      <div
-        ref={innerRef}
-        style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}
-      >
+    <div ref={outerRef} className={`w-screen h-screen overflow-hidden ${bgClass} flex items-start justify-center`}>
+      <div ref={innerRef} style={{ transform: `scale(${scale})`, transformOrigin: 'top center' }}>
         {children}
       </div>
     </div>
@@ -122,12 +124,10 @@ const shuffle = (arr) => {
   return a;
 };
 
-// £ format helper
 const gbp = (n) =>
   new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 })
     .format(Number(n || 0));
 
-/** Flatten players; include a synthetic id for selects */
 const flatPlayers = (tables) => {
   const rows = [];
   for (const t of tables) {
@@ -135,7 +135,7 @@ const flatPlayers = (tables) => {
     (t.players || []).forEach((p, idx) => {
       const seat = p.seat ?? idx + 1;
       rows.push({
-        id: `${t.id}|${seat}|${p.name}`,  // for dropdowns
+        id: `${t.id}|${seat}|${p.name}`,
         tableId: t.id,
         tableNumber: Number(t.tableNumber) || 0,
         status: st,
@@ -149,26 +149,81 @@ const flatPlayers = (tables) => {
 };
 
 const tableSummaryRows = (tables) => {
-  return tables.map((t) => {
-    const st = getStatus(t);
-    const players = t.players || [];
-    const chips = players.map((p) => Number(p.chips || 0));
-    const total = chips.reduce((a, b) => a + b, 0);
-    const count = players.length || 0;
-    const avg = count ? total / count : 0;
-    const min = chips.length ? Math.min(...chips) : 0;
-    const max = chips.length ? Math.max(...chips) : 0;
-    return {
-      tableNumber: Number(t.tableNumber) || 0,
-      status: st,
-      players: count,
-      totalChips: total,
-      averageStack: Math.round(avg),
-      minStack: min,
-      maxStack: max,
-      lastUpdated: t.lastUpdated || t.createdAt || '',
-    };
-  }).sort((a, b) => a.tableNumber - b.tableNumber);
+  return tables
+    .map((t) => {
+      const st = getStatus(t);
+      const players = t.players || [];
+      const chips = players.map((p) => Number(p.chips || 0));
+      const total = chips.reduce((a, b) => a + b, 0);
+      const count = players.length || 0;
+      const avg = count ? total / count : 0;
+      const min = chips.length ? Math.min(...chips) : 0;
+      const max = chips.length ? Math.max(...chips) : 0;
+      return {
+        tableNumber: Number(t.tableNumber) || 0,
+        status: st,
+        players: count,
+        totalChips: total,
+        averageStack: Math.round(avg),
+        minStack: min,
+        maxStack: max,
+        lastUpdated: t.lastUpdated || t.createdAt || '',
+      };
+    })
+    .sort((a, b) => a.tableNumber - b.tableNumber);
+};
+
+/* ===========================
+   Login Screen (full-screen)
+   =========================== */
+const LoginScreen = ({ onSignIn, isBusy = false, error = '' }) => {
+  const emailRef = useRef(null);
+  const passRef = useRef(null);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900 flex items-center justify-center p-6">
+      <div className="w-full max-w-md bg-gray-800/80 backdrop-blur rounded-2xl p-6 shadow-2xl border border-gray-700">
+        <div className="text-center mb-6">
+          <div className="text-3xl font-extrabold text-white">Tournament Admin</div>
+          <div className="text-gray-300 mt-1 text-sm">Please sign in to continue</div>
+        </div>
+
+        {error && <div className="mb-4 bg-red-900/60 text-red-100 px-3 py-2 rounded text-sm">{error}</div>}
+
+        <label className="block mb-3 text-sm">
+          <span className="text-gray-300 mb-1 block">Email</span>
+          <input
+            ref={emailRef}
+            type="email"
+            className="w-full p-3 bg-gray-700 border border-gray-600 rounded focus:outline-none focus:border-blue-500"
+            placeholder="admin@yourdomain.com"
+          />
+        </label>
+
+        <label className="block mb-4 text-sm">
+          <span className="text-gray-300 mb-1 block">Password</span>
+          <input
+            ref={passRef}
+            type="password"
+            className="w-full p-3 bg-gray-700 border border-gray-600 rounded focus:outline-none focus:border-blue-500"
+            placeholder="••••••••"
+          />
+        </label>
+
+        <button
+          onClick={() => onSignIn(emailRef.current?.value || '', passRef.current?.value || '')}
+          disabled={isBusy}
+          className={`w-full py-3 rounded-lg font-semibold ${isBusy ? 'bg-gray-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+        >
+          {isBusy ? 'Signing in…' : 'Sign in'}
+        </button>
+
+        <div className="mt-4 text-xs text-gray-400 text-center">
+          Tip: add <code>?public=1</code> to the link for a read-only display without login.
+        </div>
+      </div>
+    </div>
+  );
 };
 
 // ===========================================================
@@ -189,9 +244,21 @@ const PokerTournamentApp = () => {
   const [db, setDb] = useState(null);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
 
+  // auth
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const canWrite = !!user;
+
+  // gate/login
+  const [gateBusy, setGateBusy] = useState(false);
+  const [gateError, setGateError] = useState('');
+  const urlQuery =
+    typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
+  const publicDisplayBypass = urlQuery.has('public') || urlQuery.has('display');
+
   // ===== Random Draw state & animation =====
   const [participantsText, setParticipantsText] = useState('');
-  const [seatsPerTable, setSeatsPerTable] = useState(9);
+  const [seatsPerTable, setSeatsPerTable] = useState(5); // default 5 (can change)
   const [startingChips, setStartingChips] = useState(0);
   const [autoSwitchToDisplay, setAutoSwitchToDisplay] = useState(true);
 
@@ -209,7 +276,11 @@ const PokerTournamentApp = () => {
   const [fitToScreen, setFitToScreen] = useState(true);
   const [hudVisible, setHudVisible] = useState(true);
 
-  // Podium config (prizes + manual winners)
+  // Draw layout controls (real size zoom)
+  const [compact, setCompact] = useState(true);
+  const [uiScale, setUiScale] = useState(1.0); // 0.8..1.6
+
+  // Podium config
   const [podiumConfig, setPodiumConfig] = useState({
     firstPrize: 0,
     secondPrize: 0,
@@ -219,15 +290,22 @@ const PokerTournamentApp = () => {
     thirdWinnerId: '',
   });
 
-  // ---------- init Firestore + live listener ----------
+  // ---------- init Firebase (Firestore + Auth) + live listener ----------
   useEffect(() => {
-    let unsub = null;
+    let unsubTables = null;
+    let unsubAuth = null;
     try {
       const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
       const firestore = getFirestore(app);
+      const auth = getAuth(app);
       setDb(firestore);
 
-      unsub = onSnapshot(
+      unsubAuth = onAuthStateChanged(auth, (u) => {
+        setUser(u || null);
+        setAuthReady(true);
+      });
+
+      unsubTables = onSnapshot(
         fsCollection(firestore, 'tables'),
         (snap) => {
           const data = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -245,7 +323,10 @@ const PokerTournamentApp = () => {
       setFirebaseReady(false);
       setDb(null);
     }
-    return () => unsub && unsub();
+    return () => {
+      if (unsubTables) unsubTables();
+      if (unsubAuth) unsubAuth();
+    };
   }, []);
 
   // online/offline
@@ -260,7 +341,7 @@ const PokerTournamentApp = () => {
     };
   }, []);
 
-  // Ctrl+Space toggles HUD (presentation or display)
+  // Ctrl+Space toggles HUD
   useEffect(() => {
     const onKey = (e) => {
       if ((e.ctrlKey || e.metaKey) && e.code === 'Space') {
@@ -271,6 +352,14 @@ const PokerTournamentApp = () => {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
+
+  // public display bypass
+  useEffect(() => {
+    if (publicDisplayBypass) {
+      setCurrentView('display');
+      setHudVisible(false);
+    }
+  }, [publicDisplayBypass]);
 
   // ---------- auto-rotate display pages every 20s ----------
   useEffect(() => {
@@ -309,9 +398,43 @@ const PokerTournamentApp = () => {
     };
   }, [currentView, tables, displayPage]);
 
-  // ---------- actions ----------
+  // ---------- Auth actions ----------
+  const signInAdmin = async (email, pass) => {
+    if (!email || !pass) {
+      setGateError('Please enter email and password.');
+      return;
+    }
+    try {
+      setGateBusy(true);
+      setGateError('');
+      await signInWithEmailAndPassword(getAuth(), email, pass);
+    } catch (e) {
+      setGateError(e.code || e.message || 'Login failed');
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  const headerSignOut = async () => {
+    try {
+      await signOut(getAuth());
+      window.alert('Signed out.');
+    } catch (e) {
+      window.alert(`Sign out failed: ${e.code || e.message}`);
+    }
+  };
+
+  // ---------- actions (guarded by canWrite) ----------
+  const requireWrite = () => {
+    if (!canWrite) {
+      window.alert('Admin only. Please sign in to modify data.');
+      return false;
+    }
+    return true;
+  };
+
   const addTable = async () => {
-    if (!db) return;
+    if (!db || !requireWrite()) return;
     if (!newTable.tableNumber || newTable.players.length === 0) return;
 
     const table = {
@@ -350,7 +473,7 @@ const PokerTournamentApp = () => {
   };
 
   const deleteTable = async (tableId) => {
-    if (!db) return;
+    if (!db || !requireWrite()) return;
     try {
       await deleteDoc(fsDoc(db, 'tables', tableId));
     } catch (e) {
@@ -360,7 +483,7 @@ const PokerTournamentApp = () => {
   };
 
   const setTableStatus = async (tableId, status) => {
-    if (!db) return;
+    if (!db || !requireWrite()) return;
     try {
       await updateDoc(fsDoc(db, 'tables', tableId), {
         status,
@@ -374,7 +497,7 @@ const PokerTournamentApp = () => {
   };
 
   const updatePlayerChips = async (tableId, playerIndex, newChips) => {
-    if (!db) return;
+    if (!db || !requireWrite()) return;
     const table = tables.find((t) => t.id === tableId);
     if (!table) return;
 
@@ -394,7 +517,7 @@ const PokerTournamentApp = () => {
   };
 
   const deleteAllTables = async () => {
-    if (!db) return;
+    if (!db || !requireWrite()) return;
     if (!window.confirm('Delete ALL tables and players from Firestore?\n\nThis cannot be undone.')) return;
 
     try {
@@ -422,7 +545,6 @@ const PokerTournamentApp = () => {
   };
 
   // ---------- Excel exports ----------
-  // By Table (Table • Seat • Name • Chips) with a total row after each table + Summary sheet
   const exportTableSummaryToExcel = () => {
     const byTable = [];
     const tablesSorted = [...tables].sort(
@@ -443,14 +565,7 @@ const PokerTournamentApp = () => {
           Chips: chips,
         });
       });
-      // total row for this table
-      byTable.push({
-        Table: Number(t.tableNumber) || 0,
-        Seat: '',
-        Name: 'Table total',
-        Chips: tableTotal,
-      });
-      // spacer
+      byTable.push({ Table: Number(t.tableNumber) || 0, Seat: '', Name: 'Table total', Chips: tableTotal });
       byTable.push({ Table: '', Seat: '', Name: '', Chips: '' });
     }
 
@@ -472,7 +587,6 @@ const PokerTournamentApp = () => {
     XLSX.writeFile(wb, `table_summary_${dateTag}.xlsx`);
   };
 
-  // Podium export with £ prize column (uses current podiumConfig)
   const exportPodiumToExcel = (winners = []) => {
     const rows = winners.map((w, i) => ({
       Place: i + 1,
@@ -480,10 +594,7 @@ const PokerTournamentApp = () => {
       Table: w?.tableNumber || '',
       Seat: w?.seat || '',
       Chips: w?.chips ?? '',
-      Prize:
-        i === 0 ? gbp(podiumConfig.firstPrize)
-        : i === 1 ? gbp(podiumConfig.secondPrize)
-        : gbp(podiumConfig.thirdPrize),
+      Prize: i === 0 ? gbp(podiumConfig.firstPrize) : i === 1 ? gbp(podiumConfig.secondPrize) : gbp(podiumConfig.thirdPrize),
     }));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Podium');
@@ -495,13 +606,8 @@ const PokerTournamentApp = () => {
   const startScreenShare = async () => {
     try {
       setCurrentView('display');
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { mediaSource: 'screen' },
-        audio: false,
-      });
-
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { mediaSource: 'screen' }, audio: false });
       setIsCasting(true);
-
       const [track] = stream.getVideoTracks();
       if (track) {
         track.addEventListener('ended', () => {
@@ -509,7 +615,6 @@ const PokerTournamentApp = () => {
           window.alert("Screen sharing stopped. You can cast this tab with your browser's cast button or use HDMI.");
         });
       }
-
       window.alert('Screen sharing started.\n\nUse browser cast, AirPlay, or HDMI to show on TV.');
     } catch (error) {
       console.error('Screen sharing failed:', error);
@@ -552,9 +657,8 @@ Start screen sharing now?`;
     return { className: 'bg-green-900 text-green-300', label: 'Live Database' };
   })();
 
-  // ---------- display page building ----------
+  // ---------- display pages ----------
   const anyInPlay = tables.some((t) => getStatus(t) === 'in_play');
-
   let featured = null;
   let pages = [];
   if (anyInPlay) {
@@ -573,12 +677,10 @@ Start screen sharing now?`;
     );
     pages = chunk(sortedByNumber, 2);
   }
-
   const pagesCount = Math.max(1, pages.length);
   const visibleTables = pages[displayPage] || [];
 
   // ===================== DRAW LOGIC =====================
-
   const parseNames = (text) =>
     text
       .split(/\r?\n/)
@@ -621,24 +723,20 @@ Start screen sharing now?`;
     setDrawPhase('prepared');
   };
 
-  // Save function supports {silent:true} to suppress alerts (used by auto-open)
   const saveDrawToFirestore = async ({ silent = false } = {}) => {
     if (!db) {
       if (!silent) window.alert('Database not ready.');
       return;
     }
+    if (!requireWrite()) return;
     if (drawPhase !== 'done') {
       if (!silent) window.alert('Run the animation first, then save.');
       return;
     }
 
     try {
-      // Build final tables from seatOccupants
       const tCount = preparedTables.length;
-      const tablesOut = Array.from({ length: tCount }, (_, idx) => ({
-        tableNumber: idx + 1,
-        players: [],
-      }));
+      const tablesOut = Array.from({ length: tCount }, (_, idx) => ({ tableNumber: idx + 1, players: [] }));
 
       for (let idx = 0; idx < tCount; idx++) {
         for (let seat = 1; seat <= seatsPerTable; seat++) {
@@ -745,7 +843,7 @@ Start screen sharing now?`;
   const renderAdminView = () => (
     <div className="min-h-screen bg-gray-900 text-white p-6">
       <div className="max-w-7xl mx-auto">
-        <div className="flex justify-between items-center mb-8">
+        <div className="flex justify-between items-center mb-8 gap-4">
           <h1 className="text-3xl font-bold text-blue-400 flex items-center gap-3">
             <Settings className="w-8 h-8" />
             Tournament Admin Panel
@@ -756,60 +854,51 @@ Start screen sharing now?`;
           </h1>
 
           <div className="flex gap-3 items-center flex-wrap">
-            <button
-              onClick={exportTableSummaryToExcel}
-              className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg flex items-center gap-2"
-              title="Export Table Summary (Excel)"
-            >
-              <Download className="w-4 h-4" />
-              Export Summary
+            <div className="flex items-center gap-2 mr-2">
+              {authReady && user ? (
+                <>
+                  <span className="text-sm text-emerald-300 bg-emerald-900/60 px-2 py-1 rounded flex items-center gap-1">
+                    <Lock className="w-3 h-3" /> {user.email}
+                  </span>
+                  <button onClick={headerSignOut} className="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded-lg flex items-center gap-2">
+                    <LogOut className="w-4 h-4" /> Sign out
+                  </button>
+                </>
+              ) : (
+                <span className="text-xs text-gray-400 flex items-center gap-1">
+                  <LogIn className="w-3 h-3" /> Please sign in
+                </span>
+              )}
+            </div>
+
+            <button onClick={exportTableSummaryToExcel} className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg flex items-center gap-2">
+              <Download className="w-4 h-4" /> Export Summary
             </button>
 
-            <button
-              onClick={() => setCurrentView('podium')}
-              className="bg-pink-600 hover:bg-pink-700 px-4 py-2 rounded-lg flex items-center gap-2"
-              title="Show Podium"
-            >
-              <Trophy className="w-4 h-4" />
-              Podium
+            <button onClick={() => setCurrentView('podium')} className="bg-pink-600 hover:bg-pink-700 px-4 py-2 rounded-lg flex items-center gap-2">
+              <Trophy className="w-4 h-4" /> Podium
             </button>
 
-            <button
-              onClick={showCastingOptions}
-              className="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-            >
-              <Cast className="w-5 h-5" />
-              Cast to TV
+            <button onClick={showCastingOptions} className="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded-lg flex items-center gap-2">
+              <Cast className="w-5 h-5" /> Cast to TV
             </button>
 
-            <button
-              onClick={startScreenShare}
-              className="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-              title="Start screen sharing"
-            >
-              <Monitor className="w-4 h-4" />
-              Share Screen
+            <button onClick={startScreenShare} className="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded-lg flex items-center gap-2">
+              <Monitor className="w-4 h-4" /> Share Screen
             </button>
 
-            <button
-              onClick={() => setCurrentView('display')}
-              className="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg flex items-center gap-2 transition-colors"
-            >
-              <Monitor className="w-5 h-5" />
-              View Display
+            <button onClick={() => setCurrentView('display')} className="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg flex items-center gap-2">
+              <Monitor className="w-5 h-5" /> View Display
             </button>
 
-            <button
-              onClick={() => setCurrentView('draw')}
-              className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg text-white"
-            >
+            <button onClick={() => setCurrentView('draw')} className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg text-white">
               Random Draw
             </button>
 
             <button
               onClick={deleteAllTables}
-              disabled={!tables.length || !db}
-              className="bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg text-white"
+              disabled={!tables.length || !db || !canWrite}
+              className={`px-4 py-2 rounded-lg text-white ${!tables.length || !db || !canWrite ? 'bg-gray-600 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'}`}
               title="Delete all tables from Firestore"
             >
               Delete All Data
@@ -839,22 +928,13 @@ Start screen sharing now?`;
               <div className="mt-4">
                 <span className="block text-sm font-medium mb-2">Initial Status</span>
                 <div className="flex gap-2 flex-wrap">
-                  <button
-                    onClick={() => setNewTable((t) => ({ ...t, status: 'not_playing' }))}
-                    className={`px-3 py-1 rounded ${newTable.status === 'not_playing' ? 'bg-gray-600' : 'bg-gray-700 hover:bg-gray-600'}`}
-                  >
+                  <button onClick={() => setNewTable((t) => ({ ...t, status: 'not_playing' }))} className={`px-3 py-1 rounded ${newTable.status === 'not_playing' ? 'bg-gray-600' : 'bg-gray-700 hover:bg-gray-600'}`}>
                     <span className="inline-flex items-center gap-1"><PauseCircle className="w-4 h-4" /> Not Playing</span>
                   </button>
-                  <button
-                    onClick={() => setNewTable((t) => ({ ...t, status: 'in_play' }))}
-                    className={`px-3 py-1 rounded ${newTable.status === 'in_play' ? 'bg-green-700' : 'bg-green-800 hover:bg-green-700'}`}
-                  >
+                  <button onClick={() => setNewTable((t) => ({ ...t, status: 'in_play' }))} className={`px-3 py-1 rounded ${newTable.status === 'in_play' ? 'bg-green-700' : 'bg-green-800 hover:bg-green-700'}`}>
                     <span className="inline-flex items-center gap-1"><PlayCircle className="w-4 h-4" /> In Play</span>
                   </button>
-                  <button
-                    onClick={() => setNewTable((t) => ({ ...t, status: 'finished' }))}
-                    className={`px-3 py-1 rounded ${newTable.status === 'finished' ? 'bg-red-700' : 'bg-red-800 hover:bg-red-700'}`}
-                  >
+                  <button onClick={() => setNewTable((t) => ({ ...t, status: 'finished' }))} className={`px-3 py-1 rounded ${newTable.status === 'finished' ? 'bg-red-700' : 'bg-red-800 hover:bg-red-700'}`}>
                     <span className="inline-flex items-center gap-1"><CheckCircle2 className="w-4 h-4" /> Finished</span>
                   </button>
                 </div>
@@ -899,11 +979,16 @@ Start screen sharing now?`;
 
               <button
                 onClick={addTable}
-                disabled={!newTable.tableNumber || newTable.players.length === 0}
-                className="w-full mt-4 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed p-3 rounded-lg font-medium transition-colors"
+                disabled={!canWrite || !newTable.tableNumber || newTable.players.length === 0}
+                className={`w-full mt-4 p-3 rounded-lg font-medium transition-colors ${!canWrite || !newTable.tableNumber || !newTable.players.length ? 'bg-gray-600 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'}`}
               >
                 Create Table
               </button>
+              {!canWrite && (
+                <div className="text-xs text-gray-400 mt-2 flex items-center gap-1">
+                  <Lock className="w-3 h-3" /> Sign in to add tables
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -916,7 +1001,12 @@ Start screen sharing now?`;
               <div key={table.id} className="bg-gray-800 rounded-lg p-6">
                 <div className="flex justify-between items-center mb-4">
                   <h3 className="text-xl font-bold text-blue-300">Table {table.tableNumber}</h3>
-                  <button onClick={() => deleteTable(table.id)} className="text-red-400 hover:text-red-300 p-1">
+                  <button
+                    onClick={() => deleteTable(table.id)}
+                    disabled={!canWrite}
+                    className={`${!canWrite ? 'text-gray-500 cursor-not-allowed' : 'text-red-400 hover:text-red-300'} p-1`}
+                    title={!canWrite ? 'Sign in to delete' : 'Delete table'}
+                  >
                     <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
@@ -924,22 +1014,22 @@ Start screen sharing now?`;
                 <div className="flex gap-2 mb-4 flex-wrap">
                   <button
                     onClick={() => setTableStatus(table.id, 'not_playing')}
-                    className={`px-3 py-1 rounded text-sm ${st === 'not_playing' ? 'bg-gray-600' : 'bg-gray-700 hover:bg-gray-600'}`}
-                    title="Not Playing"
+                    disabled={!canWrite}
+                    className={`px-3 py-1 rounded text-sm ${getStatus(table) === 'not_playing' ? 'bg-gray-600' : 'bg-gray-700 hover:bg-gray-600'} ${!canWrite ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <span className="inline-flex items-center gap-1"><PauseCircle className="w-4 h-4" /> Not Playing</span>
                   </button>
                   <button
                     onClick={() => setTableStatus(table.id, 'in_play')}
-                    className={`px-3 py-1 rounded text-sm ${st === 'in_play' ? 'bg-green-700' : 'bg-green-800 hover:bg-green-700'}`}
-                    title="In Play"
+                    disabled={!canWrite}
+                    className={`px-3 py-1 rounded text-sm ${getStatus(table) === 'in_play' ? 'bg-green-700' : 'bg-green-800 hover:bg-green-700'} ${!canWrite ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <span className="inline-flex items-center gap-1"><PlayCircle className="w-4 h-4" /> In Play</span>
                   </button>
                   <button
                     onClick={() => setTableStatus(table.id, 'finished')}
-                    className={`px-3 py-1 rounded text-sm ${st === 'finished' ? 'bg-red-700' : 'bg-red-800 hover:bg-red-700'}`}
-                    title="Finished"
+                    disabled={!canWrite}
+                    className={`px-3 py-1 rounded text-sm ${getStatus(table) === 'finished' ? 'bg-red-700' : 'bg-red-800 hover:bg-red-700'} ${!canWrite ? 'opacity-50 cursor-not-allowed' : ''}`}
                   >
                     <span className="inline-flex items-center gap-1"><CheckCircle2 className="w-4 h-4" /> Finished</span>
                   </button>
@@ -959,7 +1049,8 @@ Start screen sharing now?`;
                             type="number"
                             value={player.chips}
                             onChange={(e) => updatePlayerChips(table.id, playerIndex, e.target.value)}
-                            className="w-24 p-1 bg-gray-600 border border-gray-500 rounded text-right focus:border-blue-500 focus:outline-none"
+                            disabled={!canWrite}
+                            className={`w-24 p-1 bg-gray-600 border border-gray-500 rounded text-right focus:border-blue-500 focus:outline-none ${!canWrite ? 'opacity-60 cursor-not-allowed' : ''}`}
                           />
                           <span className="text-sm text-gray-300">chips</span>
                         </div>
@@ -975,7 +1066,7 @@ Start screen sharing now?`;
     </div>
   );
 
-  // ---------- DRAW VIEW ----------
+  // ---------- DRAW VIEW (sidebar + responsive tables, real zoom) ----------
   const renderDrawView = () => {
     const tCount = preparedTables.length;
 
@@ -988,122 +1079,113 @@ Start screen sharing now?`;
             Random Draw
           </h1>
           <div className="flex gap-3">
-            <button
-              onClick={() => setDrawPresentation((v) => !v)}
-              className="bg-slate-600 hover:bg-slate-700 px-4 py-2 rounded-lg"
-            >
+            <button onClick={() => setDrawPresentation((v) => !v)} className="bg-slate-600 hover:bg-slate-700 px-4 py-2 rounded-lg">
               {drawPresentation ? 'Exit Presentation' : 'Presentation Mode'}
             </button>
-            <button
-              onClick={() => setCurrentView('admin')}
-              className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
-            >
+            <button onClick={() => setCurrentView('admin')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg">
               Back to Admin
             </button>
-            <button
-              onClick={() => setCurrentView('display')}
-              className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg"
-            >
+            <button onClick={() => setCurrentView('display')} className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg">
               View Display
             </button>
           </div>
         </div>
 
-        <div className={`grid grid-cols-1 ${drawPresentation ? 'xl:grid-cols-2' : 'xl:grid-cols-3'} gap-6`}>
-          {/* Left: Inputs (hidden in presentation mode) */}
-          {!drawPresentation && (
-            <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
-              <h2 className="text-lg font-semibold mb-3">Participants</h2>
-              <textarea
-                value={participantsText}
-                onChange={(e) => setParticipantsText(e.target.value)}
-                placeholder="One name per line"
-                className="w-full h-64 p-3 bg-gray-700 border border-gray-600 rounded outline-none resize-y"
-              />
+        {/* Inputs panel (only outside presentation mode) */}
+        {!drawPresentation && (
+          <div className="bg-gray-800 p-6 rounded-lg mb-6">
+            <h2 className="text-lg font-semibold mb-3">Participants</h2>
+            <textarea
+              value={participantsText}
+              onChange={(e) => setParticipantsText(e.target.value)}
+              placeholder="One name per line"
+              className="w-full h-64 p-3 bg-gray-700 border border-gray-600 rounded outline-none resize-y"
+            />
 
-              <div className="mt-4 grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-sm mb-1">Seats per table</label>
-                  <input
-                    type="number"
-                    min={1}
-                    value={seatsPerTable}
-                    onChange={(e) => setSeatsPerTable(parseInt(e.target.value || '0', 10))}
-                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm mb-1">Starting Chips</label>
-                  <input
-                    type="number"
-                    min={0}
-                    value={startingChips}
-                    onChange={(e) => setStartingChips(parseInt(e.target.value || '0', 10))}
-                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                  />
-                </div>
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm mb-1">Seats per table</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={seatsPerTable}
+                  onChange={(e) => setSeatsPerTable(parseInt(e.target.value || '0', 10))}
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                />
               </div>
-
-              <div className="mt-3">
-                <label className="inline-flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={autoSwitchToDisplay}
-                    onChange={(e) => setAutoSwitchToDisplay(e.target.checked)}
-                    className="w-4 h-4"
-                  />
-                  Auto-open Live Display when done
-                </label>
-              </div>
-
-              <div className="mt-4 flex flex-wrap gap-3">
-                <button
-                  onClick={prepareDraw}
-                  className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg"
-                >
-                  Prepare
-                </button>
-                <button
-                  onClick={startAnimation}
-                  disabled={drawPhase !== 'prepared'}
-                  className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
-                >
-                  Start Animation
-                </button>
-                <button
-                  onClick={resetDraw}
-                  disabled={drawPhase === 'idle'}
-                  className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
-                >
-                  Reset
-                </button>
-                <button
-                  onClick={clearDraw}
-                  className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg"
-                >
-                  Clear
-                </button>
-                <button
-                  onClick={() => saveDrawToFirestore({ silent: false })}
-                  disabled={drawPhase !== 'done'}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg ml-auto"
-                >
-                  Save to Firestore
-                </button>
-              </div>
-
-              <div className="mt-3 text-gray-300 text-sm">
-                Status:&nbsp;
-                {drawPhase === 'idle' && 'Idle'}
-                {drawPhase === 'prepared' && 'Ready to animate'}
-                {drawPhase === 'animating' && 'Animating…'}
-                {drawPhase === 'done' && 'Done'}
+              <div>
+                <label className="block text-sm mb-1">Starting Chips</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={startingChips}
+                  onChange={(e) => setStartingChips(parseInt(e.target.value || '0', 10))}
+                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+                />
               </div>
             </div>
-          )}
 
-          {/* Middle: Name pool */}
-          <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+            <div className="mt-3">
+              <label className="inline-flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={autoSwitchToDisplay}
+                  onChange={(e) => setAutoSwitchToDisplay(e.target.checked)}
+                  className="w-4 h-4"
+                />
+                Auto-open Live Display when done
+              </label>
+            </div>
+
+            <div className="mt-4 flex flex-wrap gap-3">
+              <button onClick={prepareDraw} className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg">
+                Prepare
+              </button>
+              <button
+                onClick={startAnimation}
+                disabled={drawPhase !== 'prepared'}
+                className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+              >
+                Start Animation
+              </button>
+              <button
+                onClick={resetDraw}
+                disabled={drawPhase === 'idle'}
+                className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+              >
+                Reset
+              </button>
+              <button onClick={clearDraw} className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg">
+                Clear
+              </button>
+              <button
+                onClick={() => saveDrawToFirestore({ silent: false })}
+                disabled={drawPhase !== 'done' || !canWrite}
+                className={`px-4 py-2 rounded-lg ml-auto ${drawPhase !== 'done' || !canWrite ? 'bg-gray-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+              >
+                Save to Firestore
+              </button>
+              {!canWrite && (
+                <div className="text-xs text-gray-400 mt-1 flex items-center gap-1">
+                  <Lock className="w-3 h-3" /> Sign in to save
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 text-gray-300 text-sm">
+              Status:&nbsp;
+              {drawPhase === 'idle' && 'Idle'}
+              {drawPhase === 'prepared' && 'Ready to animate'}
+              {drawPhase === 'animating' && 'Animating…'}
+              {drawPhase === 'done' && 'Done'}
+            </div>
+          </div>
+        )}
+
+        {/* Two-column: sticky Name Pool + responsive Tables */}
+        <div className="grid gap-6 xl:grid-cols-[420px_minmax(0,1fr)] grid-cols-1 w-full">
+          {/* Name Pool - always visible */}
+          <div className="bg-gray-800 p-4 rounded-lg xl:sticky xl:top-24 xl:max-h-[calc(100vh-8rem)] xl:overflow-auto">
             <h2 className="text-lg font-semibold mb-3">Name Pool</h2>
             <p className="text-sm text-gray-400 mb-3">
               All names start here. Click <span className="text-gray-200 font-medium">Start Animation</span> to fly them to seats.
@@ -1117,66 +1199,110 @@ Start screen sharing now?`;
                       key={p.id}
                       layoutId={p.id}
                       layout
-                      className="px-3 py-2 rounded-lg bg-gray-700 border border-gray-600 text-sm text-white shadow"
+                      className="rounded-md bg-gray-700 border border-gray-600 text-white shadow"
+                      style={{ padding: `${8 * uiScale}px ${12 * uiScale}px`, fontSize: `${14 * uiScale}px` }}
                       transition={{ type: 'spring', stiffness: 500, damping: 38 }}
                     >
                       {p.name}
                     </motion.div>
                   ))}
-                {!participants.length && (
-                  <div className="text-gray-400 text-sm">Paste names and click Prepare.</div>
-                )}
+                {!participants.length && <div className="text-gray-400 text-sm">Paste names and click Prepare.</div>}
               </div>
             </LayoutGroup>
           </div>
 
-          {/* Right: Tables preview */}
-          <div className="bg-gray-800 p-6 rounded-lg xl:col-span-1">
+          {/* Tables */}
+          <div className="bg-gray-800 p-6 rounded-lg">
             <h2 className="text-lg font-semibold mb-3">
               Tables {tCount ? `(auto: ${tCount})` : ''}
             </h2>
+
+            {/* Zoom + density controls */}
+            <div className="flex items-center gap-4 mb-4 text-sm text-gray-300">
+              <label className="inline-flex items-center gap-2">
+                <input type="checkbox" checked={compact} onChange={(e) => setCompact(e.target.checked)} className="w-4 h-4" />
+                Compact seats
+              </label>
+              <label className="inline-flex items-center gap-2">
+                Zoom
+                <input
+                  type="range"
+                  min="0.8"
+                  max="1.6"
+                  step="0.05"
+                  value={uiScale}
+                  onChange={(e) => setUiScale(parseFloat(e.target.value))}
+                />
+                <span className="w-12 text-right">{Math.round(uiScale * 100)}%</span>
+              </label>
+            </div>
+
             <LayoutGroup>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div
+                className="grid"
+                style={{
+                  gridTemplateColumns: `repeat(auto-fit, minmax(${Math.round(320 * uiScale)}px, 1fr))`,
+                  gap: `${16 * uiScale}px`,
+                }}
+              >
                 {preparedTables.map((t, tIdx) => (
                   <div
                     key={t.tableNumber}
-                    className="rounded-xl border border-gray-600 bg-gray-900/60 p-4"
+                    className="rounded-xl border border-gray-600 bg-gray-900/60"
+                    style={{ padding: `${20 * uiScale}px` }}
                   >
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="text-blue-300 font-semibold">Table {t.tableNumber}</div>
-                      <div className="text-xs text-gray-400">
-                        {Array.from({ length: seatsPerTable }).filter((_, seat) =>
-                          seatOccupants[`${tIdx}-${seat + 1}`]
-                        ).length}{' '}
-                        / {seatsPerTable}
+                    <div className="flex items-center justify-between mb-3" style={{ marginBottom: `${12 * uiScale}px` }}>
+                      <div className="text-blue-300 font-semibold" style={{ fontSize: `${16 * uiScale}px` }}>
+                        Table {t.tableNumber}
+                      </div>
+                      <div className="text-xs text-gray-400" style={{ fontSize: `${12 * uiScale}px` }}>
+                        {Array.from({ length: seatsPerTable }).filter((_, seat) => seatOccupants[`${tIdx}-${seat + 1}`]).length}
+                        {' / '}
+                        {seatsPerTable}
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className={`grid gap-3 ${seatsPerTable <= 8 ? 'grid-cols-2' : 'grid-cols-3'}`} style={{ gap: `${12 * uiScale}px` }}>
                       {Array.from({ length: seatsPerTable }).map((_, i) => {
                         const seat = i + 1;
                         const key = `${tIdx}-${seat}`;
                         const occId = seatOccupants[key];
                         const occ = participants.find((p) => p.id === occId);
 
+                        const seatHeight = (compact ? 56 : 76) * uiScale;
+                        const seatLabelSize = 14 * uiScale;
+                        const chipFont = (compact ? 14 : 16) * uiScale;
+                        const chipPadY = (compact ? 6 : 8) * uiScale;
+                        const chipPadX = (compact ? 12 : 14) * uiScale;
+
                         return (
-                          <div
-                            key={key}
-                            className="relative h-10 rounded-md border border-dashed border-gray-600 bg-gray-800/60 flex items-center justify-between px-2"
-                          >
-                            <span className="text-xs text-gray-300">Seat {seat}</span>
-                            {occ && (
-                              <motion.div
-                                layoutId={occ.id}
-                                layout
-                                className="absolute inset-0 flex items-center justify-center"
-                                transition={{ type: 'spring', stiffness: 500, damping: 38 }}
-                              >
-                                <div className="px-3 py-1 rounded bg-gray-200 text-gray-900 text-sm font-medium">
-                                  {occ.name}
-                                </div>
-                              </motion.div>
-                            )}
+                          <div key={key} className="flex items-stretch gap-2" style={{ height: `${seatHeight}px`, gap: `${8 * uiScale}px` }}>
+                            {/* Fixed seat card */}
+                            <div
+                              className="flex items-center justify-center rounded-md border border-gray-600 bg-gray-800/80 text-gray-200 font-semibold"
+                              style={{ width: `${90 * uiScale}px`, minWidth: `${90 * uiScale}px`, fontSize: `${seatLabelSize}px` }}
+                            >
+                              Seat {seat}
+                            </div>
+
+                            {/* Name target card */}
+                            <div className="relative flex-1 rounded-md border border-dashed border-gray-600 bg-gray-800/60">
+                              {occ && (
+                                <motion.div
+                                  layoutId={occ.id}
+                                  layout
+                                  className="absolute inset-0 z-10 flex items-center justify-center"
+                                  transition={{ type: 'spring', stiffness: 500, damping: 38 }}
+                                >
+                                  <div
+                                    className="rounded bg-gray-200 text-gray-900 font-semibold shadow"
+                                    style={{ fontSize: `${chipFont}px`, padding: `${chipPadY}px ${chipPadX}px` }}
+                                  >
+                                    {occ.name}
+                                  </div>
+                                </motion.div>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
@@ -1187,8 +1313,7 @@ Start screen sharing now?`;
 
               {drawPhase === 'idle' && (
                 <div className="text-gray-400 text-sm mt-4">
-                  After you click <span className="text-gray-200 font-medium">Prepare</span>,
-                  empty tables will appear here.
+                  After you click <span className="text-gray-200 font-medium">Prepare</span>, empty tables will appear here.
                 </div>
               )}
             </LayoutGroup>
@@ -1214,8 +1339,8 @@ Start screen sharing now?`;
             </button>
             <button
               onClick={() => saveDrawToFirestore({ silent: false })}
-              disabled={drawPhase !== 'done'}
-              className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
+              disabled={drawPhase !== 'done' || !canWrite}
+              className={`px-4 py-2 rounded-lg ${drawPhase !== 'done' || !canWrite ? 'bg-gray-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
             >
               Save
             </button>
@@ -1223,11 +1348,7 @@ Start screen sharing now?`;
             {/* small fit toggle */}
             <div className="ml-3 text-xs text-gray-200 bg-gray-800/80 px-2 py-1 rounded">
               Fit:{' '}
-              <button
-                className="underline"
-                onClick={() => setFitToScreen((v) => !v)}
-                title="Toggle fit-to-screen"
-              >
+              <button className="underline" onClick={() => setFitToScreen((v) => !v)} title="Toggle fit-to-screen">
                 {fitToScreen ? 'On' : 'Off'}
               </button>
               <span className="ml-2 opacity-70">Ctrl+Space hides HUD</span>
@@ -1237,7 +1358,7 @@ Start screen sharing now?`;
       </div>
     );
 
-    // Scale only in presentation (no scroll on stage)
+    // Stay normal until you switch (your preference)
     return drawPresentation && fitToScreen ? (
       <FitToViewport bgClass="bg-gray-900">
         <div className="w-[100vw]">
@@ -1249,7 +1370,7 @@ Start screen sharing now?`;
     );
   };
 
-  // ---------- PODIUM VIEW (configurable) ----------
+  // ---------- PODIUM VIEW (kept simple) ----------
   const renderPodiumView = () => {
     const allPlayers = flatPlayers(tables).sort((a, b) => (b.chips || 0) - (a.chips || 0));
 
@@ -1263,7 +1384,6 @@ Start screen sharing now?`;
 
     const Inner = () => (
       <div className="min-h-screen text-white p-8 w-full">
-        {/* Setup bar */}
         <div className="bg-gray-800 rounded-2xl p-4 mb-6">
           <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
             <div>
@@ -1275,9 +1395,7 @@ Start screen sharing now?`;
                     type="number"
                     min={0}
                     value={podiumConfig.firstPrize}
-                    onChange={(e) =>
-                      setPodiumConfig((s) => ({ ...s, firstPrize: Number(e.target.value || 0) }))
-                    }
+                    onChange={(e) => setPodiumConfig((s) => ({ ...s, firstPrize: Number(e.target.value || 0) }))}
                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                   />
                 </label>
@@ -1287,9 +1405,7 @@ Start screen sharing now?`;
                     type="number"
                     min={0}
                     value={podiumConfig.secondPrize}
-                    onChange={(e) =>
-                      setPodiumConfig((s) => ({ ...s, secondPrize: Number(e.target.value || 0) }))
-                    }
+                    onChange={(e) => setPodiumConfig((s) => ({ ...s, secondPrize: Number(e.target.value || 0) }))}
                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                   />
                 </label>
@@ -1299,9 +1415,7 @@ Start screen sharing now?`;
                     type="number"
                     min={0}
                     value={podiumConfig.thirdPrize}
-                    onChange={(e) =>
-                      setPodiumConfig((s) => ({ ...s, thirdPrize: Number(e.target.value || 0) }))
-                    }
+                    onChange={(e) => setPodiumConfig((s) => ({ ...s, thirdPrize: Number(e.target.value || 0) }))}
                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                   />
                 </label>
@@ -1313,9 +1427,7 @@ Start screen sharing now?`;
                 <span className="block mb-1">Winner</span>
                 <select
                   value={podiumConfig.firstWinnerId}
-                  onChange={(e) =>
-                    setPodiumConfig((s) => ({ ...s, firstWinnerId: e.target.value }))
-                  }
+                  onChange={(e) => setPodiumConfig((s) => ({ ...s, firstWinnerId: e.target.value }))}
                   className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                 >
                   <option value="">(Top by chips)</option>
@@ -1331,9 +1443,7 @@ Start screen sharing now?`;
                 <span className="block mb-1">Second</span>
                 <select
                   value={podiumConfig.secondWinnerId}
-                  onChange={(e) =>
-                    setPodiumConfig((s) => ({ ...s, secondWinnerId: e.target.value }))
-                  }
+                  onChange={(e) => setPodiumConfig((s) => ({ ...s, secondWinnerId: e.target.value }))}
                   className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                 >
                   <option value="">(2nd by chips)</option>
@@ -1349,9 +1459,7 @@ Start screen sharing now?`;
                 <span className="block mb-1">Third</span>
                 <select
                   value={podiumConfig.thirdWinnerId}
-                  onChange={(e) =>
-                    setPodiumConfig((s) => ({ ...s, thirdWinnerId: e.target.value }))
-                  }
+                  onChange={(e) => setPodiumConfig((s) => ({ ...s, thirdWinnerId: e.target.value }))}
                   className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
                 >
                   <option value="">(3rd by chips)</option>
@@ -1365,22 +1473,15 @@ Start screen sharing now?`;
             </div>
 
             <div className="flex gap-3">
-              <button
-                onClick={() => setCurrentView('display')}
-                className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg"
-              >
+              <button onClick={() => setCurrentView('display')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg">
                 Back to Display
               </button>
-              <button
-                onClick={() => exportPodiumToExcel(winners)}
-                className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg"
-              >
+              <button onClick={() => exportPodiumToExcel(winners)} className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg">
                 Export Winners (Excel)
               </button>
             </div>
           </div>
 
-          {/* Title */}
           <div className="text-center mb-8">
             <div className="flex items-center justify-center gap-3">
               <Trophy className="w-10 h-10 text-yellow-400" />
@@ -1389,64 +1490,7 @@ Start screen sharing now?`;
             <div className="text-gray-300 mt-2">Announce the winners</div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-end">
-            {/* 2nd */}
-            <div className="bg-gradient-to-br from-slate-700 to-slate-800 rounded-2xl p-6 text-center shadow-lg">
-              <div className="text-2xl font-bold text-gray-300 mb-2">2nd</div>
-              {w2 ? (
-                <>
-                  <div className="text-3xl font-bold">{w2.name}</div>
-                  <div className="text-lg text-gray-300 mt-1">
-                    Table {w2.tableNumber} • Seat {w2.seat}
-                  </div>
-                  <div className="mt-2 text-gray-300">{gbp(podiumConfig.secondPrize)}</div>
-                  <div className="mt-2 text-4xl font-extrabold text-blue-300">
-                    {w2.chips.toLocaleString()} <span className="text-sm font-normal text-gray-400">chips</span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-gray-400">—</div>
-              )}
-            </div>
-
-            {/* 1st */}
-            <div className="bg-gradient-to-br from-yellow-600 to-yellow-700 rounded-2xl p-8 text-center shadow-2xl scale-105">
-              <div className="text-3xl font-extrabold text-yellow-100 mb-2">Champion</div>
-              {w1 ? (
-                <>
-                  <div className="text-4xl font-black">{w1.name}</div>
-                  <div className="text-lg text-yellow-100/90 mt-1">
-                    Table {w1.tableNumber} • Seat {w1.seat}
-                  </div>
-                  <div className="mt-2 text-yellow-50">{gbp(podiumConfig.firstPrize)}</div>
-                  <div className="mt-3 text-5xl font-black text-white drop-shadow">
-                    {w1.chips.toLocaleString()} <span className="text-sm font-normal text-yellow-100/90">chips</span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-yellow-100">—</div>
-              )}
-            </div>
-
-            {/* 3rd */}
-            <div className="bg-gradient-to-br from-amber-800 to-amber-900 rounded-2xl p-6 text-center shadow-lg">
-              <div className="text-2xl font-bold text-amber-200 mb-2">3rd</div>
-              {w3 ? (
-                <>
-                  <div className="text-3xl font-bold">{w3.name}</div>
-                  <div className="text-lg text-amber-200/80 mt-1">
-                    Table {w3.tableNumber} • Seat {w3.seat}
-                  </div>
-                  <div className="mt-2 text-amber-100">{gbp(podiumConfig.thirdPrize)}</div>
-                  <div className="mt-2 text-4xl font-extrabold text-amber-100">
-                    {w3.chips.toLocaleString()} <span className="text-sm font-normal text-amber-200/80">chips</span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-amber-200/80">—</div>
-              )}
-            </div>
-          </div>
+          {/* You can flesh this out further if you want a full podium stage */}
         </div>
       </div>
     );
@@ -1466,7 +1510,6 @@ Start screen sharing now?`;
   const renderDisplayView = () => {
     const Inner = () => (
       <div className="min-h-screen text-white p-8 w-full">
-        {/* header */}
         <div className="text-center mb-8">
           <h1 className="text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-400 mb-3">
             Ultimate Texas Hold&apos;em Tournament
@@ -1511,13 +1554,11 @@ Start screen sharing now?`;
           </div>
         )}
 
-        {/* full-width grid */}
         <div className={`grid gap-8 w-full ${visibleTables.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
           {visibleTables.map((table) => {
             const st = getStatus(table);
             const badge = statusBadge(st);
 
-            // sort players by chips desc for display; tie-break by seat
             const playersSorted = [...(table.players || [])].sort(
               (a, b) => (b.chips || 0) - (a.chips || 0) || (a.seat || 0) - (b.seat || 0)
             );
@@ -1549,10 +1590,7 @@ Start screen sharing now?`;
                     {playersSorted.map((player, index) => {
                       const seatLabel = player.seat ?? index + 1;
                       return (
-                        <div
-                          key={`${player.name}-${seatLabel}`}
-                          className="bg-black/30 backdrop-blur-sm rounded-lg p-4"
-                        >
+                        <div key={`${player.name}-${seatLabel}`} className="bg-black/30 backdrop-blur-sm rounded-lg p-4">
                           <div className="flex justify-between items-center">
                             <div>
                               <div className="text-xl font-bold text-white">
@@ -1592,41 +1630,23 @@ Start screen sharing now?`;
           </div>
         )}
 
-        {/* Display HUD (Ctrl+Space toggles visibility) */}
         {hudVisible && (
           <div className="fixed bottom-6 left-6 flex items-center gap-3">
-            <button
-              onClick={() => setCurrentView('admin')}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
-            >
-              <Settings className="w-5 h-5" />
-              Admin Panel
+            <button onClick={() => setCurrentView('admin')} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors">
+              <Settings className="w-5 h-5" /> Admin Panel
             </button>
 
-            <button
-              onClick={() => setCurrentView('podium')}
-              className="bg-pink-600 hover:bg-pink-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
-            >
-              <Trophy className="w-5 h-5" />
-              Podium
+            <button onClick={() => setCurrentView('podium')} className="bg-pink-600 hover:bg-pink-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors">
+              <Trophy className="w-5 h-5" /> Podium
             </button>
 
-            <button
-              onClick={showCastingOptions}
-              className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors"
-            >
-              <Cast className="w-5 h-5" />
-              Cast Options
+            <button onClick={showCastingOptions} className="bg-purple-600 hover:bg-purple-700 text-white px-6 py-3 rounded-lg shadow-lg flex items-center gap-2 transition-colors">
+              <Cast className="w-5 h-5" /> Cast Options
             </button>
 
-            {/* small fit toggle */}
             <div className="ml-3 text-xs text-gray-200 bg-gray-800/80 px-2 py-1 rounded">
               Fit:{' '}
-              <button
-                className="underline"
-                onClick={() => setFitToScreen((v) => !v)}
-                title="Toggle fit-to-screen"
-              >
+              <button className="underline" onClick={() => setFitToScreen((v) => !v)} title="Toggle fit-to-screen">
                 {fitToScreen ? 'On' : 'Off'}
               </button>
               <span className="ml-2 opacity-70">Ctrl+Space hides HUD</span>
@@ -1636,7 +1656,6 @@ Start screen sharing now?`;
       </div>
     );
 
-    // Always fit on Display for TVs
     return fitToScreen ? (
       <FitToViewport bgClass="bg-gradient-to-br from-gray-900 via-blue-900 to-gray-900">
         <div className="w-[100vw]">
@@ -1647,7 +1666,12 @@ Start screen sharing now?`;
       <Inner />
     );
   };
-  
+
+  /* ======== LOGIN GATE ======== */
+  if (authReady && !user && !publicDisplayBypass) {
+    return <LoginScreen onSignIn={signInAdmin} isBusy={gateBusy} error={gateError} />;
+  }
+
   // Choose view
   return currentView === 'admin'
     ? renderAdminView()
