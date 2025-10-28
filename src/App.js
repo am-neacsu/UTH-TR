@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, memo } from 'react';
 import {
   Users,
   Monitor,
@@ -35,11 +35,12 @@ import {
   deleteDoc,
   getDocs,
   writeBatch,
-  query,            // Firestore query()
+  query,
   orderBy,
   startAfter,
   limit,
   documentId,
+  setDoc,
 } from 'firebase/firestore';
 import {
   getAuth,
@@ -60,7 +61,7 @@ const firebaseConfig = {
 };
 
 // -------- Animation pacing (ms per name) --------
-const DRAW_STEP_MS = 1000;
+const DRAW_STEP_MS = 2500;
 
 /** Fit children to viewport (no scroll), center them, and paint the whole screen. */
 const FitToViewport = ({ children, bgClass = 'bg-gray-900' }) => {
@@ -79,7 +80,7 @@ const FitToViewport = ({ children, bgClass = 'bg-gray-900' }) => {
       const iw = inner.scrollWidth || inner.clientWidth || 1;
       const ih = inner.scrollHeight || inner.clientHeight || 1;
 
-      const s = Math.min(1, ow / iw, oh / ih) * 0.98; // margin
+      const s = Math.min(1, ow / iw, oh / ih) * 0.98;
       setScale(Number.isFinite(s) ? s : 1);
     };
 
@@ -226,6 +227,242 @@ const LoginScreen = ({ onSignIn, isBusy = false, error = '' }) => {
   );
 };
 
+/* ===========================
+   Memoized Draw form (keeps focus)
+   =========================== */
+const DrawParticipantsPanel = memo(function DrawParticipantsPanel({
+  initialText,
+  seatsPerTable,
+  startingChips,
+  autoOpen,
+  onChangeSeats,
+  onChangeChips,
+  onToggleAutoOpen,
+  onPrepare, // (text) => void
+  onStart,
+  onReset,
+  onClear,
+  onSave,
+  canSave,
+  statusLabel,
+}) {
+  const [localText, setLocalText] = useState(initialText);
+
+  // If parent clears the text (Clear), reflect that
+  useEffect(() => {
+    if (!initialText) setLocalText('');
+  }, [initialText]);
+
+  return (
+    <div className="bg-gray-800 p-6 rounded-lg mb-6">
+      <h2 className="text-lg font-semibold mb-3">Participants</h2>
+
+      <textarea
+        value={localText}
+        onChange={(e) => setLocalText(e.target.value)}
+        placeholder="One name per line"
+        className="w-full h-64 p-3 bg-gray-700 border border-gray-600 rounded outline-none resize-y"
+      />
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-sm mb-1">Seats per table</label>
+          <input
+            type="number"
+            min={1}
+            value={seatsPerTable}
+            onChange={(e) => onChangeSeats(parseInt(e.target.value || '0', 10))}
+            className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+          />
+        </div>
+        <div>
+          <label className="block text-sm mb-1">Starting Chips</label>
+          <input
+            type="number"
+            min={0}
+            value={startingChips}
+            onChange={(e) => onChangeChips(parseInt(e.target.value || '0', 10))}
+            className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+          />
+        </div>
+      </div>
+
+      <div className="mt-3">
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={autoOpen}
+            onChange={(e) => onToggleAutoOpen(e.target.checked)}
+            className="w-4 h-4"
+          />
+          Auto-open Live Display when done
+        </label>
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-3">
+        <button onClick={() => onPrepare(localText)} className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg">
+          Prepare
+        </button>
+        <button onClick={onStart} className="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg">
+          Start Animation
+        </button>
+        <button onClick={onReset} className="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded-lg">
+          Reset
+        </button>
+        <button onClick={onClear} className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg">
+          Clear
+        </button>
+        <button
+          onClick={onSave}
+          disabled={!canSave}
+          className={`px-4 py-2 rounded-lg ml-auto ${!canSave ? 'bg-gray-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+        >
+          Save to Firestore
+        </button>
+      </div>
+
+      <div className="mt-3 text-gray-300 text-sm">Status: {statusLabel}</div>
+    </div>
+  );
+});
+
+/* ===========================
+   Memoized Podium setup panel (keeps focus)
+   =========================== */
+const PodiumSetupPanel = memo(function PodiumSetupPanel({
+  initialPrizes,                  // { first, second, third }
+  initialSelection,               // { firstId, secondId, thirdId }
+  players,                        // array from flatPlayers(tables)
+  onChangePrizes,                 // ({first,second,third}) => void
+  onChangeSelection,              // ({firstId,secondId,thirdId}) => void
+  onBackToDisplay,
+  onExportExcel,
+  podiumScale,
+  onChangeScale,
+}) {
+  const [p1, setP1] = useState(initialPrizes.first);
+  const [p2, setP2] = useState(initialPrizes.second);
+  const [p3, setP3] = useState(initialPrizes.third);
+  const [w1, setW1] = useState(initialSelection.firstId);
+  const [w2, setW2] = useState(initialSelection.secondId);
+  const [w3, setW3] = useState(initialSelection.thirdId);
+
+  useEffect(() => { setP1(initialPrizes.first); setP2(initialPrizes.second); setP3(initialPrizes.third); }, [initialPrizes]);
+  useEffect(() => { setW1(initialSelection.firstId); setW2(initialSelection.secondId); setW3(initialSelection.thirdId); }, [initialSelection]);
+
+  const commitPrizes = () => onChangePrizes({ first: Number(p1||0), second: Number(p2||0), third: Number(p3||0) });
+
+  return (
+    <div className="bg-gray-800 rounded-2xl p-4 mb-6">
+      <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+        <div>
+          <div className="text-xl font-bold mb-2">Podium setup</div>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+            <label className="text-sm">
+              <span className="block mb-1">1st Prize (£)</span>
+              <input type="number" min={0} value={p1} onChange={(e)=>setP1(e.target.value)}
+                     onBlur={commitPrizes}
+                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded" />
+            </label>
+            <label className="text-sm">
+              <span className="block mb-1">2nd Prize (£)</span>
+              <input type="number" min={0} value={p2} onChange={(e)=>setP2(e.target.value)}
+                     onBlur={commitPrizes}
+                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded" />
+            </label>
+            <label className="text-sm">
+              <span className="block mb-1">3rd Prize (£)</span>
+              <input type="number" min={0} value={p3} onChange={(e)=>setP3(e.target.value)}
+                     onBlur={commitPrizes}
+                     className="w-full p-2 bg-gray-700 border border-gray-600 rounded" />
+            </label>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 flex-1">
+          <label className="text-sm">
+            <span className="block mb-1">Winner</span>
+            <select
+              value={w1}
+              onChange={(e) => {
+                const val = e.target.value;
+                setW1(val);
+                onChangeSelection({ firstId: val, secondId: w2, thirdId: w3 });
+              }}
+              className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+            >
+              <option value="">(Select manually)</option>
+              {players.map((p)=>(
+                <option key={p.id} value={p.id}>
+                  {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="text-sm">
+            <span className="block mb-1">Second</span>
+            <select
+              value={w2}
+              onChange={(e) => {
+                const val = e.target.value;
+                setW2(val);
+                onChangeSelection({ firstId: w1, secondId: val, thirdId: w3 });
+              }}
+              className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+            >
+              <option value="">(Select manually)</option>
+              {players.map((p)=>(
+                <option key={p.id} value={p.id}>
+                  {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="text-sm">
+            <span className="block mb-1">Third</span>
+            <select
+              value={w3}
+              onChange={(e) => {
+                const val = e.target.value;
+                setW3(val);
+                onChangeSelection({ firstId: w1, secondId: w2, thirdId: val });
+              }}
+              className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
+            >
+              <option value="">(Select manually)</option>
+              {players.map((p)=>(
+                <option key={p.id} value={p.id}>
+                  {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Size slider */}
+          <label className="text-sm text-gray-300 flex items-center gap-2">
+            Size
+            <input type="range" min="0.9" max="1.8" step="0.05"
+                   value={podiumScale}
+                   onChange={(e)=>onChangeScale(parseFloat(e.target.value))} />
+            <span className="w-10 text-right">{Math.round(podiumScale*100)}%</span>
+          </label>
+
+          <button onClick={onBackToDisplay} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg">
+            Back to Display
+          </button>
+          <button onClick={onExportExcel} className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg">
+            Export Winners (Excel)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
 // ===========================================================
 const PokerTournamentApp = () => {
   const [tables, setTables] = useState([]);
@@ -280,7 +517,7 @@ const PokerTournamentApp = () => {
   const [compact, setCompact] = useState(true);
   const [uiScale, setUiScale] = useState(1.0); // 0.8..1.6
 
-  // Podium config
+  // Podium config (local fallback)
   const [podiumConfig, setPodiumConfig] = useState({
     firstPrize: 0,
     secondPrize: 0,
@@ -290,10 +527,19 @@ const PokerTournamentApp = () => {
     thirdWinnerId: '',
   });
 
-  // ---------- init Firebase (Firestore + Auth) + live listener ----------
+  // ---- Firestore-synced UI controls (shared across devices) ----
+  const [ui, setUi] = useState({
+    podiumSetupVisible: false,   // hidden by default
+    podiumScale: 1.4,
+    podiumPrizes: { first: 0, second: 0, third: 0 },
+    podiumSelection: { firstId: '', secondId: '', thirdId: '' },
+  });
+
+  // ---------- init Firebase (Firestore + Auth) + live listeners ----------
   useEffect(() => {
     let unsubTables = null;
     let unsubAuth = null;
+    let unsubUi = null;
     try {
       const app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
       const firestore = getFirestore(app);
@@ -309,8 +555,14 @@ const PokerTournamentApp = () => {
         fsCollection(firestore, 'tables'),
         (snap) => {
           const data = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-          setTables(data);
-          setLastUpdate(Date.now());
+          setTables((prev) => {
+            const same =
+              prev.length === data.length &&
+              prev.every((row, i) => row.id === data[i].id && JSON.stringify(row) === JSON.stringify(data[i]));
+            if (same) return prev;
+            setLastUpdate(Date.now());
+            return data;
+          });
           setFirebaseReady(true);
         },
         (err) => {
@@ -318,6 +570,36 @@ const PokerTournamentApp = () => {
           setFirebaseReady(false);
         }
       );
+
+      // Shared UI controls
+      const uiRef = fsDoc(firestore, 'controls', 'ui');
+      unsubUi = onSnapshot(uiRef, async (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setUi((prev) => ({
+            podiumSetupVisible: !!data.podiumSetupVisible,
+            podiumScale: Number(data.podiumScale ?? prev.podiumScale),
+            podiumPrizes: {
+              first: Number(data?.podiumPrizes?.first ?? prev.podiumPrizes.first ?? 0),
+              second: Number(data?.podiumPrizes?.second ?? prev.podiumPrizes.second ?? 0),
+              third: Number(data?.podiumPrizes?.third ?? prev.podiumPrizes.third ?? 0),
+            },
+            podiumSelection: {
+              firstId: data?.podiumSelection?.firstId ?? prev.podiumSelection.firstId ?? '',
+              secondId: data?.podiumSelection?.secondId ?? prev.podiumSelection.secondId ?? '',
+              thirdId: data?.podiumSelection?.thirdId ?? prev.podiumSelection.thirdId ?? '',
+            },
+          }));
+        } else {
+          await setDoc(uiRef, {
+            podiumSetupVisible: false,
+            podiumScale: 1.4,
+            podiumPrizes: { first: 0, second: 0, third: 0 },
+            podiumSelection: { firstId: '', secondId: '', thirdId: '' },
+            createdAt: new Date().toISOString(),
+          });
+        }
+      });
     } catch (e) {
       console.error('Firebase init error:', e);
       setFirebaseReady(false);
@@ -326,6 +608,7 @@ const PokerTournamentApp = () => {
     return () => {
       if (unsubTables) unsubTables();
       if (unsubAuth) unsubAuth();
+      if (unsubUi) unsubUi();
     };
   }, []);
 
@@ -594,7 +877,7 @@ const PokerTournamentApp = () => {
       Table: w?.tableNumber || '',
       Seat: w?.seat || '',
       Chips: w?.chips ?? '',
-      Prize: i === 0 ? gbp(podiumConfig.firstPrize) : i === 1 ? gbp(podiumConfig.secondPrize) : gbp(podiumConfig.thirdPrize),
+      Prize: i === 0 ? gbp(ui.podiumPrizes.first) : i === 1 ? gbp(ui.podiumPrizes.second) : gbp(ui.podiumPrizes.third),
     }));
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Podium');
@@ -687,8 +970,9 @@ Start screen sharing now?`;
       .map((s) => s.trim())
       .filter(Boolean);
 
-  const prepareDraw = () => {
-    const names = parseNames(participantsText);
+  const prepareDraw = (textOverride) => {
+    const sourceText = textOverride ?? participantsText;
+    const names = parseNames(sourceText);
     if (!names.length) {
       window.alert('Add at least one participant name.');
       return;
@@ -699,7 +983,7 @@ Start screen sharing now?`;
     }
 
     const base = names.map((name, i) => ({ id: `${name}-${i}`, name }));
-    const shuffled = shuffle(base);
+    const shuffled = shuffle(base); // randomness each run
     const tCount = Math.ceil(shuffled.length / seatsPerTable);
 
     const tablesPreview = Array.from({ length: tCount }, (_, idx) => ({
@@ -839,6 +1123,16 @@ Start screen sharing now?`;
     setDrawPhase('idle');
   };
 
+  // ---- helper to update shared UI controls doc ----
+  const updateUi = async (patch) => {
+    if (!db) return;
+    try {
+      await updateDoc(fsDoc(db, 'controls', 'ui'), { ...patch, updatedAt: new Date().toISOString() });
+    } catch (e) {
+      console.error('Failed to update UI controls', e);
+    }
+  };
+
   // ---------- ADMIN VIEW ----------
   const renderAdminView = () => (
     <div className="min-h-screen bg-gray-900 text-white p-6">
@@ -853,7 +1147,7 @@ Start screen sharing now?`;
             </div>
           </h1>
 
-          <div className="flex gap-3 items-center flex-wrap">
+        <div className="flex gap-3 items-center flex-wrap">
             <div className="flex items-center gap-2 mr-2">
               {authReady && user ? (
                 <>
@@ -1066,7 +1360,7 @@ Start screen sharing now?`;
     </div>
   );
 
-  // ---------- DRAW VIEW (sidebar + responsive tables, real zoom) ----------
+  // ---------- DRAW VIEW ----------
   const renderDrawView = () => {
     const tCount = preparedTables.length;
 
@@ -1091,95 +1385,31 @@ Start screen sharing now?`;
           </div>
         </div>
 
-        {/* Inputs panel (only outside presentation mode) */}
+        {/* Inputs panel (memoized to keep focus) */}
         {!drawPresentation && (
-          <div className="bg-gray-800 p-6 rounded-lg mb-6">
-            <h2 className="text-lg font-semibold mb-3">Participants</h2>
-            <textarea
-              value={participantsText}
-              onChange={(e) => setParticipantsText(e.target.value)}
-              placeholder="One name per line"
-              className="w-full h-64 p-3 bg-gray-700 border border-gray-600 rounded outline-none resize-y"
-            />
-
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-sm mb-1">Seats per table</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={seatsPerTable}
-                  onChange={(e) => setSeatsPerTable(parseInt(e.target.value || '0', 10))}
-                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                />
-              </div>
-              <div>
-                <label className="block text-sm mb-1">Starting Chips</label>
-                <input
-                  type="number"
-                  min={0}
-                  value={startingChips}
-                  onChange={(e) => setStartingChips(parseInt(e.target.value || '0', 10))}
-                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                />
-              </div>
-            </div>
-
-            <div className="mt-3">
-              <label className="inline-flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={autoSwitchToDisplay}
-                  onChange={(e) => setAutoSwitchToDisplay(e.target.checked)}
-                  className="w-4 h-4"
-                />
-                Auto-open Live Display when done
-              </label>
-            </div>
-
-            <div className="mt-4 flex flex-wrap gap-3">
-              <button onClick={prepareDraw} className="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded-lg">
-                Prepare
-              </button>
-              <button
-                onClick={startAnimation}
-                disabled={drawPhase !== 'prepared'}
-                className="bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
-              >
-                Start Animation
-              </button>
-              <button
-                onClick={resetDraw}
-                disabled={drawPhase === 'idle'}
-                className="bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed px-4 py-2 rounded-lg"
-              >
-                Reset
-              </button>
-              <button onClick={clearDraw} className="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded-lg">
-                Clear
-              </button>
-              <button
-                onClick={() => saveDrawToFirestore({ silent: false })}
-                disabled={drawPhase !== 'done' || !canWrite}
-                className={`px-4 py-2 rounded-lg ml-auto ${drawPhase !== 'done' || !canWrite ? 'bg-gray-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
-              >
-                Save to Firestore
-              </button>
-              {!canWrite && (
-                <div className="text-xs text-gray-400 mt-1 flex items-center gap-1">
-                  <Lock className="w-3 h-3" /> Sign in to save
-                </div>
-              )}
-            </div>
-
-            <div className="mt-3 text-gray-300 text-sm">
-              Status:&nbsp;
-              {drawPhase === 'idle' && 'Idle'}
-              {drawPhase === 'prepared' && 'Ready to animate'}
-              {drawPhase === 'animating' && 'Animating…'}
-              {drawPhase === 'done' && 'Done'}
-            </div>
-          </div>
+          <DrawParticipantsPanel
+            initialText={participantsText}
+            seatsPerTable={seatsPerTable}
+            startingChips={startingChips}
+            autoOpen={autoSwitchToDisplay}
+            onChangeSeats={setSeatsPerTable}
+            onChangeChips={setStartingChips}
+            onToggleAutoOpen={setAutoSwitchToDisplay}
+            onPrepare={(text) => {
+              setParticipantsText(text);
+              prepareDraw(text);
+            }}
+            onStart={startAnimation}
+            onReset={resetDraw}
+            onClear={clearDraw}
+            onSave={() => saveDrawToFirestore({ silent: false })}
+            canSave={drawPhase === 'done' && !!user}
+            statusLabel={
+              drawPhase === 'idle' ? 'Idle' :
+              drawPhase === 'prepared' ? 'Ready to animate' :
+              drawPhase === 'animating' ? 'Animating…' : 'Done'
+            }
+          />
         )}
 
         {/* Two-column: sticky Name Pool + responsive Tables */}
@@ -1358,7 +1588,6 @@ Start screen sharing now?`;
       </div>
     );
 
-    // Stay normal until you switch (your preference)
     return drawPresentation && fitToScreen ? (
       <FitToViewport bgClass="bg-gray-900">
         <div className="w-[100vw]">
@@ -1370,127 +1599,142 @@ Start screen sharing now?`;
     );
   };
 
-  // ---------- PODIUM VIEW (kept simple) ----------
-  const renderPodiumView = () => {
+  // ---------- PODIUM VIEW (defaults BLANK; manual only) ----------
+  const PodiumView = () => {
+    const isPublicDisplay = publicDisplayBypass;
+
+    // Firestore-synced values:
+    const setupVisible = !!ui.podiumSetupVisible;
+    const podiumScale = Number(ui.podiumScale || 1.4);
+    const prizes = ui.podiumPrizes || { first: 0, second: 0, third: 0 };
+    const selection = ui.podiumSelection || { firstId: '', secondId: '', thirdId: '' };
+
     const allPlayers = flatPlayers(tables).sort((a, b) => (b.chips || 0) - (a.chips || 0));
 
-    const resolveWinner = (id, fallbackIndex) =>
-      allPlayers.find((p) => p.id === id) || allPlayers[fallbackIndex];
+    // NEW: Only use manual selections; leave blank if not selected.
+    function pickWinners() {
+      const pool = [...allPlayers];
+      const takeById = (id) => {
+        if (!id) return null;
+        const i = pool.findIndex((p) => p.id === id);
+        if (i >= 0) { const [p] = pool.splice(i, 1); return p; }
+        return null;
+      };
+      const w1 = takeById(selection.firstId) || null;
+      const w2 = takeById(selection.secondId) || null;
+      const w3 = takeById(selection.thirdId) || null;
+      return [w1, w2, w3];
+    }
+    const [w1, w2, w3] = pickWinners();
 
-    const w1 = resolveWinner(podiumConfig.firstWinnerId, 0);
-    const w2 = resolveWinner(podiumConfig.secondWinnerId, 1);
-    const w3 = resolveWinner(podiumConfig.thirdWinnerId, 2);
-    const winners = [w1, w2, w3];
+    const StageCard = ({ place, person, baseW, baseH, color, prize }) => {
+      const w = `${baseW * podiumScale}rem`;
+      const h = `${baseH * podiumScale}rem`;
+      const nameClass = `font-extrabold ${podiumScale >= 1.4 ? 'text-4xl md:text-5xl' : 'text-2xl md:text-3xl'}`;
+
+      return (
+        <div className="flex flex-col items-center">
+          <div
+            className="flex items-center justify-center rounded-t-2xl shadow-lg"
+            style={{ width: w, height: h, background: color }}
+          >
+            <div className="text-center px-4">
+              <div className={nameClass}>{person?.name || '—'}</div>
+              {person && (
+                <div className="mt-1 text-sm md:text-base opacity-90">
+                  Table {person.tableNumber} • Seat {person.seat}
+                </div>
+              )}
+              {person && (
+                <div className="mt-2 text-base md:text-lg font-semibold opacity-90">
+                  {Number(person.chips || 0).toLocaleString()} chips
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="bg-gray-900/70 border border-gray-700 w-full text-center py-2 rounded-b-2xl mt-[1px]">
+            <span className="font-bold">{place}</span>
+            <span className="ml-2 text-gray-300">{gbp(prize)}</span>
+          </div>
+        </div>
+      );
+    };
 
     const Inner = () => (
       <div className="min-h-screen text-white p-8 w-full">
-        <div className="bg-gray-800 rounded-2xl p-4 mb-6">
-          <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-            <div>
-              <div className="text-xl font-bold mb-2">Podium setup</div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <label className="text-sm">
-                  <span className="block mb-1">1st Prize (£)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={podiumConfig.firstPrize}
-                    onChange={(e) => setPodiumConfig((s) => ({ ...s, firstPrize: Number(e.target.value || 0) }))}
-                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                  />
-                </label>
-                <label className="text-sm">
-                  <span className="block mb-1">2nd Prize (£)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={podiumConfig.secondPrize}
-                    onChange={(e) => setPodiumConfig((s) => ({ ...s, secondPrize: Number(e.target.value || 0) }))}
-                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                  />
-                </label>
-                <label className="text-sm">
-                  <span className="block mb-1">3rd Prize (£)</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={podiumConfig.thirdPrize}
-                    onChange={(e) => setPodiumConfig((s) => ({ ...s, thirdPrize: Number(e.target.value || 0) }))}
-                    className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                  />
-                </label>
-              </div>
-            </div>
+        {!isPublicDisplay && (
+          <div className="flex justify-end mb-3">
+            <button
+              onClick={() => updateUi({ podiumSetupVisible: !setupVisible })}
+              className="bg-gray-700 hover:bg-gray-600 px-3 py-2 rounded-lg"
+              title="Show/Hide setup on all devices"
+            >
+              {!isPublicDisplay && setupVisible ? 'Hide Setup' : 'Show Setup'}
+            </button>
+          </div>
+        )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <label className="text-sm">
-                <span className="block mb-1">Winner</span>
-                <select
-                  value={podiumConfig.firstWinnerId}
-                  onChange={(e) => setPodiumConfig((s) => ({ ...s, firstWinnerId: e.target.value }))}
-                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                >
-                  <option value="">(Top by chips)</option>
-                  {allPlayers.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
-                    </option>
-                  ))}
-                </select>
-              </label>
+        {!isPublicDisplay && setupVisible && (
+          <PodiumSetupPanel
+            initialPrizes={{ first: prizes.first, second: prizes.second, third: prizes.third }}
+            initialSelection={{ firstId: selection.firstId, secondId: selection.secondId, thirdId: selection.thirdId }}
+            players={allPlayers}
+            onChangePrizes={(p) => {
+              setPodiumConfig((s) => ({ ...s, firstPrize: p.first, secondPrize: p.second, thirdPrize: p.third }));
+              updateUi({ podiumPrizes: p });
+            }}
+            onChangeSelection={(sel) => {
+              setPodiumConfig((s) => ({ ...s, firstWinnerId: sel.firstId, secondWinnerId: sel.secondId, thirdWinnerId: sel.thirdId }));
+              updateUi({ podiumSelection: sel });
+            }}
+            onBackToDisplay={() => setCurrentView('display')}
+            onExportExcel={() => exportPodiumToExcel([w1, w2, w3])}
+            podiumScale={podiumScale}
+            onChangeScale={(val) => updateUi({ podiumScale: val })}
+          />
+        )}
 
-              <label className="text-sm">
-                <span className="block mb-1">Second</span>
-                <select
-                  value={podiumConfig.secondWinnerId}
-                  onChange={(e) => setPodiumConfig((s) => ({ ...s, secondWinnerId: e.target.value }))}
-                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                >
-                  <option value="">(2nd by chips)</option>
-                  {allPlayers.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
-                    </option>
-                  ))}
-                </select>
-              </label>
+        <div className="text-center mb-4">
+          <div className="flex items-center justify-center gap-3">
+            <span className="text-yellow-400 text-4xl">🏆</span>
+            <h1 className="text-5xl font-extrabold">Podium</h1>
+          </div>
+          <div className="text-gray-300 mt-2">Announce the winners</div>
+        </div>
 
-              <label className="text-sm">
-                <span className="block mb-1">Third</span>
-                <select
-                  value={podiumConfig.thirdWinnerId}
-                  onChange={(e) => setPodiumConfig((s) => ({ ...s, thirdWinnerId: e.target.value }))}
-                  className="w-full p-2 bg-gray-700 border border-gray-600 rounded"
-                >
-                  <option value="">(3rd by chips)</option>
-                  {allPlayers.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} — Table {p.tableNumber} Seat {p.seat} — {p.chips.toLocaleString()} chips
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <div className="flex gap-3">
-              <button onClick={() => setCurrentView('display')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg">
-                Back to Display
-              </button>
-              <button onClick={() => exportPodiumToExcel(winners)} className="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded-lg">
-                Export Winners (Excel)
-              </button>
-            </div>
+        <div className="flex flex-col items-center mt-8">
+          <div className="flex items-end justify-center gap-6 w-full max-w-7xl">
+            <StageCard
+              place="2nd"
+              person={w2}
+              baseW={14}
+              baseH={12}
+              color="linear-gradient(180deg,#c0c0c0,#8d8d8d)"
+              prize={prizes.second}
+            />
+            <StageCard
+              place="1st"
+              person={w1}
+              baseW={18}
+              baseH={16}
+              color="linear-gradient(180deg,#ffd54d,#ffb300)"
+              prize={prizes.first}
+            />
+            <StageCard
+              place="3rd"
+              person={w3}
+              baseW={14}
+              baseH={10}
+              color="linear-gradient(180deg,#d7a97f,#8a6a4f)"
+              prize={prizes.third}
+            />
           </div>
 
-          <div className="text-center mb-8">
-            <div className="flex items-center justify-center gap-3">
-              <Trophy className="w-10 h-10 text-yellow-400" />
-              <h1 className="text-5xl font-extrabold">Podium</h1>
-            </div>
-            <div className="text-gray-300 mt-2">Announce the winners</div>
+          <div className="mt-2 flex justify-center gap-6 w-full max-w-7xl">
+            <div className="bg-gray-800 h-3 w-56 rounded" />
+            <div className="bg-gray-800 h-3 w-72 rounded" />
+            <div className="bg-gray-800 h-3 w-56 rounded" />
           </div>
-
-          {/* You can flesh this out further if you want a full podium stage */}
         </div>
       </div>
     );
@@ -1678,7 +1922,7 @@ Start screen sharing now?`;
     : currentView === 'draw'
     ? renderDrawView()
     : currentView === 'podium'
-    ? renderPodiumView()
+    ? <PodiumView />
     : renderDisplayView();
 };
 
